@@ -1,0 +1,9 @@
+(module math (export square sum-to)
+  (define (square x) (* x x))
+  (define (sum-to n)
+    (if (or (< n 0) (not (= (modulo n 1) 0)))
+        (error "sum-to expects a nonnegative integer" n)
+        (let loop ((remaining n) (total 0))
+          (if (<= remaining 0)
+              total
+              (loop (- remaining 1) (+ total remaining)))))))

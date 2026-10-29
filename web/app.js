@@ -1,5 +1,8 @@
+import { LIMITS } from "./limits.js";
+import { formatEvaluations } from "./results.js";
+
 const examples = [
-  { name: "Hello, Lisp", symbol: "(+)", caption: "Start small. Change a number.", source: `; Everything starts with an expression.
+  { name: "Hello, Lisp", source: `; Everything starts with an expression.
 (+ 1 2 3)
 
 ; Put expressions inside expressions.
@@ -8,7 +11,7 @@ const examples = [
 ; Give an idea a name.
 (define answer 42)
 (* answer 2)` },
-  { name: "Make a function", symbol: "λ", caption: "A function is a value, too.", source: `; Name a function.
+  { name: "Make a function", source: `; Name a function.
 (define (square x)
   (* x x))
 
@@ -20,7 +23,7 @@ const examples = [
 
 (define add-ten (add-by 10))
 (add-ten 32)` },
-  { name: "Lists & patterns", symbol: "′()", caption: "One operation. A whole list.", source: `; A quote keeps a list as data.
+  { name: "Lists & patterns", source: `; A quote keeps a list as data.
 (define numbers '(1 2 3 4 5 6))
 
 ; Transform every item.
@@ -32,7 +35,7 @@ const examples = [
 
 ; Bring the list together.
 (apply + numbers)` },
-  { name: "Think recursively", symbol: "↻", caption: "A problem, made a little smaller.", source: `; Factorial: n × (n-1) × ... × 1
+  { name: "Think recursively", source: `; Factorial: n × (n-1) × ... × 1
 (define (factorial n)
   (if (<= n 1)
       1
@@ -42,7 +45,7 @@ const examples = [
 
 ; Try a different input.
 (factorial 10)` },
-  { name: "Choose a path", symbol: "?", caption: "Only #f is false. Every other value is true.", source: `; Local names, one small decision.
+  { name: "Choose a path", source: `; Local names, one small decision.
 (let ((temperature 18)
       (threshold 20))
   (if (< temperature threshold)
@@ -57,48 +60,100 @@ const examples = [
 const $ = (id) => document.getElementById(id);
 const editor = $("editor");
 const results = $("results");
-let worker, timer, busy = false, ready = false, runCount = 0, currentLabel = "";
-let selected = 0;
+let worker, timer, runCount = 0, currentLabel = "";
+let runtimeState = "loading";
 let history = [], historyPosition = 0;
+const sourceFiles = new Map();
+let sourceName = "<program>", inputLimit, sourceLimit;
+
+function saveSource() {
+  if (sourceFiles.has(sourceName)) sourceFiles.set(sourceName, editor.value);
+}
 
 function updateLines() {
   $("line-numbers").textContent = Array.from({ length: editor.value.split("\n").length }, (_, i) => i + 1).join("\n");
 }
 
 function selectExample(index) {
-  selected = index;
+  saveSource();
+  sourceName = "<program>";
   editor.value = examples[index].source;
-  $("example-caption").textContent = examples[index].caption;
-  document.querySelectorAll(".example").forEach((button, i) => button.setAttribute("aria-current", String(i === index)));
+  $("example-list").value = String(index);
   updateLines();
 }
 
 examples.forEach((example, i) => {
-  const button = document.createElement("button");
-  button.className = "example";
-  const name = document.createElement("span");
-  name.textContent = example.name;
-  const symbol = document.createElement("span");
-  symbol.textContent = example.symbol;
-  symbol.setAttribute("aria-hidden", "true");
-  button.append(name, symbol);
-  button.addEventListener("click", () => selectExample(i));
-  $("example-list").append(button);
+  const option = document.createElement("option");
+  option.value = String(i);
+  option.textContent = example.name;
+  $("example-list").append(option);
+});
+$("example-list").addEventListener("change", (event) => {
+  const selected = event.target.value;
+  if (!selected.startsWith("file:")) {
+    selectExample(Number(selected));
+    return;
+  }
+  saveSource();
+  sourceName = selected.slice(5);
+  editor.value = sourceFiles.get(sourceName);
+  updateLines();
+});
+$("open-files").addEventListener("click", () => $("source-files").click());
+$("source-files").addEventListener("change", async (event) => {
+  const files = [...event.target.files];
+  event.target.value = "";
+  if (!files.length || runtimeState !== "ready") return;
+  const instance = worker;
+  setRuntimeState("running", "Opening…");
+  try {
+    const names = new Set(sourceFiles.keys());
+    const selected = new Set();
+    for (const file of files) {
+      if (selected.has(file.name)) throw new Error(`Duplicate filename: ${file.name}. Open files with distinct names.`);
+      selected.add(file.name);
+      names.add(file.name);
+      if (file.size > inputLimit) throw new Error(`${file.name}: program exceeds the 64 KiB input limit.`);
+    }
+    if (names.size > sourceLimit) throw new Error(`Open at most ${sourceLimit} source files per session.`);
+    const loaded = await Promise.all(files.map(async (file) => [
+      file.name, new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer()),
+    ]));
+    if (instance !== worker) return;
+    saveSource();
+    for (const [name, source] of loaded) {
+      if (!sourceFiles.has(name)) {
+        const option = document.createElement("option");
+        option.value = `file:${name}`;
+        option.textContent = name;
+        $("example-list").append(option);
+      }
+      sourceFiles.set(name, source);
+    }
+    sourceName = loaded[0][0];
+    editor.value = sourceFiles.get(sourceName);
+    $("example-list").value = `file:${sourceName}`;
+    updateLines();
+    setRuntimeState("ready", "Ready");
+  } catch (error) {
+    if (instance !== worker) return;
+    setRuntimeState("ready", "Ready");
+    addResult(error.message, true, "Open files");
+  }
 });
 
-function controls() {
-  $("run").disabled = !ready || busy;
-  $("repl-run").disabled = !ready || busy;
-  $("run").firstChild.textContent = busy ? "Running… " : "Run program ";
-}
-
-function status(text, state = "") {
+function setRuntimeState(state, text) {
+  runtimeState = state;
+  $("run").disabled = state !== "ready";
+  $("repl-run").disabled = state !== "ready";
+  $("open-files").disabled = state !== "ready";
+  $("run").textContent = state === "running" ? "Running…" : "Run";
   $("runtime-status").textContent = text;
-  $("status-dot").className = `status-dot ${state}`;
+  const color = state === "ready" || state === "running" ? "ready" : state === "failed" ? "error" : "";
+  $("status-dot").className = `status-dot ${color}`;
 }
 
 function addResult(text, failed, label, elapsed) {
-  results.querySelector(".empty-result")?.remove();
   const entry = document.createElement("div");
   entry.className = `result-entry${failed ? " error" : ""}`;
   const heading = document.createElement("div");
@@ -112,71 +167,74 @@ function addResult(text, failed, label, elapsed) {
   value.textContent = text || "No expressions to evaluate.";
   entry.append(heading, value);
   results.append(entry);
-  while (results.children.length > 40) results.firstElementChild.remove();
+  while (results.children.length > LIMITS.resultEntries) results.firstElementChild.remove();
   results.scrollTop = results.scrollHeight;
+}
+
+function failRuntime(status, detail) {
+  clearTimeout(timer);
+  worker?.terminate();
+  worker = undefined;
+  setRuntimeState("failed", status);
+  addResult(detail, true, "Runtime");
 }
 
 function startRuntime() {
   clearTimeout(timer);
   worker?.terminate();
-  ready = false;
-  busy = false;
-  controls();
-  status("Loading WebAssembly…");
-  const instance = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  worker = undefined;
+  setRuntimeState("loading", "Loading…");
+  let instance;
+  try {
+    instance = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  } catch (error) {
+    failRuntime("Could not load. Reset session to retry.", error.message);
+    return;
+  }
   worker = instance;
   timer = setTimeout(() => {
-    instance.terminate();
-    status("Loading timed out. Reset session to retry.", "error");
-    addResult("The runtime could not load. Check your connection, then reset the session.", true, "Runtime");
-  }, 15000);
+    failRuntime("Loading timed out. Reset session to retry.",
+      "The runtime could not load. Check your connection, then reset the session.");
+  }, LIMITS.loadTimeoutMs);
   instance.onmessage = ({ data }) => {
     if (instance !== worker) return;
     clearTimeout(timer);
     if (data.type === "ready") {
-      ready = true;
-      status("WebAssembly ready · runs locally", "ready");
+      inputLimit = data.inputLimit;
+      sourceLimit = data.sourceLimit;
+      setRuntimeState("ready", "Ready");
     } else if (data.type === "result") {
-      busy = false;
-      addResult(data.text, data.failed, currentLabel, data.elapsed);
+      setRuntimeState("ready", "Ready");
+      addResult(data.error ?? formatEvaluations(data.evaluations), data.error !== null, currentLabel, data.elapsed);
     } else if (data.type === "fatal") {
       addResult(`${data.text}\nThe runtime was restarted; definitions were cleared.`, true, currentLabel);
       startRuntime();
     } else if (data.type === "load-error") {
-      instance.terminate();
-      ready = false;
-      busy = false;
-      status("Could not load. Reset session to retry.", "error");
-      addResult(data.text, true, "Runtime");
+      failRuntime("Could not load. Reset session to retry.", data.text);
     }
-    controls();
   };
   instance.onerror = (event) => {
     event.preventDefault();
-    clearTimeout(timer);
-    instance.terminate();
-    ready = false;
-    busy = false;
-    status("Runtime stopped. Reset session to retry.", "error");
-    addResult(event.message || "Unexpected worker error. Reset the session to retry.", true, "Runtime");
-    controls();
+    if (instance !== worker) return;
+    failRuntime("Runtime stopped. Reset session to retry.",
+      event.message || "Unexpected worker error. Reset the session to retry.");
   };
 }
 
-function evaluate(source, label) {
-  if (!ready || busy) return;
+function evaluate(source, label, name = sourceName) {
+  if (runtimeState !== "ready") return;
   if (!source.trim()) {
     addResult("Write an expression first, such as (+ 1 2).", true, label);
     return;
   }
-  busy = true;
+  setRuntimeState("running", "Running…");
   currentLabel = label;
-  controls();
-  worker.postMessage({ type: "evaluate", source });
+  saveSource();
+  worker.postMessage({ type: "evaluate", source, name, sources: [...sourceFiles] });
   timer = setTimeout(() => {
-    addResult("Execution stopped after 3 seconds. Definitions were cleared; try a smaller program.", true, currentLabel);
+    addResult(`Execution stopped after ${LIMITS.evaluationTimeoutMs / 1000} seconds. Definitions were cleared; try a smaller program.`, true, currentLabel);
     startRuntime();
-  }, 3000);
+  }, LIMITS.evaluationTimeoutMs);
 }
 
 $("run").addEventListener("click", () => evaluate(editor.value, `Program ${++runCount}`));
@@ -195,8 +253,8 @@ editor.addEventListener("keydown", (event) => {
 $("repl-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const source = $("repl").value;
-  if (!ready || busy) return;
-  evaluate(source, `λ ${source}`);
+  if (runtimeState !== "ready") return;
+  evaluate(source, `λ ${source}`, "<repl>");
   if (source.trim()) {
     history.push(source);
     historyPosition = history.length;
@@ -212,8 +270,8 @@ $("repl").addEventListener("keydown", (event) => {
 $("reset").addEventListener("click", () => {
   results.replaceChildren();
   runCount = 0;
-  addResult("Fresh session. Your editor is unchanged; definitions and results have been cleared.", false, "Session reset");
+  addResult("Definitions cleared.", false, "Session reset");
   startRuntime();
 });
-selectExample(selected);
+selectExample(0);
 startRuntime();
