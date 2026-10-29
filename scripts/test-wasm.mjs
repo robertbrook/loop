@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { builtAsset } from "./built-assets.mjs";
 import { formatEvaluations } from "../web/results.js";
 
-const { instance } = await WebAssembly.instantiate(await readFile(new URL("../dist/loop.wasm", import.meta.url)));
+const { instance } = await WebAssembly.instantiate(await readFile(builtAsset("loop.wasm")));
 const runtime = instance.exports;
 function execute(source) {
   const bytes = new TextEncoder().encode(source);
