@@ -1,61 +1,50 @@
 <!doctype html>
-<!-- THESIS: A language-reference workbench, not a marketing page.
-OWN-WORLD: Cool white, ink blue, squared controls, open reference columns.
-STORY: Choose a small idea, edit its program, evaluate, then experiment.
-FIRST VIEWPORT: Example index left, large editor center, results right. Run sits above the editor.
-FORM: Reference workbench, grounded direction 5, seed 991e96d1. -->
+<!-- Loop workbench: program and results, with examples available in a select.
+Keep the cool-blue palette in both themes; omit promotional and tutorial copy. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#2449ba">
+  <meta name="color-scheme" content="light dark">
   <meta name="description" content="Loop is a Lisp dialect implemented in Rust, running in your browser with WebAssembly. Write, run, and explore.">
-  <title>Loop — a Lisp for your browser</title>
+  <title>Loop</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232449ba'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-size='42' fill='white' font-family='monospace'%3E()%3C/text%3E%3C/svg%3E">
+  <script src="./theme.js"></script>
   <link rel="stylesheet" href="./style.css">
   <script type="module" src="./app.js"></script>
 </head>
 <body>
   <header class="masthead">
-    <a class="brand" href="./" aria-label="Loop home"><span class="brand-mark" aria-hidden="true">(↻)</span> loop<span class="brand-dot">.</span></a>
-    <span class="tagline">Small language. Endless possibilities.</span>
-    <a class="source-link" href="https://github.com/robertbrook/loop" target="_blank" rel="noreferrer">Source code <span aria-hidden="true">↗</span></a>
+    <h1>Loop</h1>
+    <div class="runtime"><span id="status-dot" class="status-dot" aria-hidden="true"></span><span id="runtime-status" role="status">Loading…</span></div>
+    <select id="theme" aria-label="Color theme">
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <a href="https://github.com/robertbrook/loop#language" target="_blank" rel="noreferrer">Reference</a>
+    <a href="https://github.com/robertbrook/loop" target="_blank" rel="noreferrer">Source</a>
   </header>
   <main>
-    <section class="intro" aria-labelledby="headline">
-      <h1 id="headline">Think in parentheses.</h1>
-      <p>A Lisp, right in your browser. Change something.<br>Run it. See where the next expression takes you.</p>
-      <div class="runtime"><span id="status-dot" class="status-dot"></span><span id="runtime-status" role="status">Loading WebAssembly…</span></div>
-    </section>
     <div class="workbench">
-      <aside class="examples" aria-labelledby="examples-title">
-        <h2 id="examples-title">A place to start</h2>
-        <nav id="example-list" aria-label="Example programs"></nav>
-        <div class="aside-note"><span aria-hidden="true">( )</span><p>Code is data.<br>Small pieces compose.<br>Curiosity does the rest.</p></div>
-      </aside>
       <section class="editor-panel" aria-labelledby="program-title">
-        <div class="panel-toolbar"><h2 id="program-title">Your program <span class="file-type">.scm</span></h2><button id="run" class="primary" disabled>Run program <span aria-hidden="true">↗</span></button></div>
+        <div class="panel-toolbar">
+          <h2 id="program-title">Program</h2>
+          <button id="open-files" class="quiet" disabled>Open files</button>
+          <input id="source-files" type="file" accept=".loop,.lisp,.scm,text/plain" multiple hidden>
+          <select id="example-list" aria-label="Load example or source file"></select>
+          <button id="run" class="primary" title="Run program (Ctrl/Cmd+Enter)" disabled>Run</button>
+        </div>
         <div class="editor-wrap"><div id="line-numbers" aria-hidden="true">1</div><textarea id="editor" aria-label="Lisp program" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea></div>
-        <div class="editor-footer"><span id="example-caption"></span><span><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd> to run</span></div>
       </section>
       <section class="results-panel" aria-labelledby="results-title">
         <div class="panel-toolbar"><h2 id="results-title">Result</h2><button id="reset" class="quiet" title="Clear results and definitions">Reset session</button></div>
-        <div id="results" role="log" aria-live="polite" aria-relevant="additions"><div class="empty-result"><span aria-hidden="true">⇒</span><p>The next idea starts here.</p><small>Run a program to see its value.</small></div></div>
-        <form id="repl-form"><label for="repl">Try an expression</label><div class="repl-input"><span aria-hidden="true">λ</span><input id="repl" placeholder="(+ 1 2)" spellcheck="false" autocomplete="off" aria-label="REPL expression"><button id="repl-run" type="submit" disabled aria-label="Evaluate expression">↵</button></div><small>Definitions stay until you reset.</small></form>
+        <div id="results" role="log" aria-label="Evaluation results" aria-live="polite" aria-relevant="additions"></div>
+        <form id="repl-form"><label for="repl">REPL</label><div class="repl-input"><span aria-hidden="true">λ</span><input id="repl" placeholder="(+ 1 2)" spellcheck="false" autocomplete="off" aria-label="REPL expression"><button id="repl-run" type="submit" disabled aria-label="Evaluate expression">↵</button></div></form>
       </section>
     </div>
-    <section class="guide" aria-labelledby="guide-title">
-      <div><h2 id="guide-title">The language,<br> in a few lines.</h2><p>Loop is its own Lisp dialect, built in Rust.<br>This workbench is one way to use it.</p></div>
-      <dl>
-        <div><dt><code>(define x 10)</code></dt><dd>Give a value a name.</dd></div>
-        <div><dt><code>(lambda (x) (* x x))</code></dt><dd>Make a function.</dd></div>
-        <div><dt><code>(if (&gt; x 5) 'yes 'no)</code></dt><dd>Choose a path. Only <code>#f</code> is false.</dd></div>
-        <div><dt><code>'(1 2 3)</code></dt><dd>Quote a list instead of evaluating it.</dd></div>
-      </dl>
-      <details><summary>Language reference</summary><div class="reference"><p><strong>Forms</strong> <code>define lambda if quote begin let and or</code></p><p><strong>Numbers</strong> <code>+ - * / = &lt; &gt; &lt;= &gt;= modulo abs</code></p><p><strong>Lists</strong> <code>list car cdr cons append length map filter apply</code></p><p><strong>Predicates &amp; output</strong> <code>not null? number? list? display newline</code></p><p>Numbers are 64-bit floats. Strings support <code>\n \t \" \\</code>. Comments begin with <code>;</code>. Functions use lexical scope. <code>let</code> bindings are evaluated in the enclosing scope. <code>if</code> requires both branches.</p><p>Loop is under development. Macros, mutation, dotted pairs, and tail-call optimization are not implemented yet. Programs are currently bounded to 100,000 evaluation steps and 128 nested calls; reset the session to reclaim stored definitions. Each top-level expression returns a value; output procedures return <code>()</code>.</p></div></details>
-    </section>
   </main>
-  <footer><span>Made of lists, functions, and possibility.</span><span>Rust → WebAssembly → your browser</span></footer>
   <noscript>Loop needs JavaScript and WebAssembly enabled to run the Lisp interpreter.</noscript>
 </body>
 </html>

@@ -1,0 +1,4 @@
+(load "math.loop")
+(import math square sum-to)
+(map square '(1 2 3 4 5))
+(sum-to 1000)

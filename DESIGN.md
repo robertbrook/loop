@@ -1,6 +1,6 @@
 ---
 name: Loop
-description: A light ink-blue workbench for exploring the Loop Lisp dialect.
+description: A cool-blue workbench with light and dark themes for the Loop Lisp dialect.
 colors:
   primary: "#2449ba"
   ink: "#19294d"
@@ -15,8 +15,25 @@ colors:
   success: "#24774e"
   warning: "#a86a15"
   error: "#aa2739"
+  primary-hover: "#18388f"
+  quiet-hover: "#e0e7f7"
+  dark-primary: "#99b5ff"
+  dark-ink: "#dce5f5"
+  dark-muted: "#a9b8d2"
+  dark-page: "#141b29"
+  dark-surface: "#1c2535"
+  dark-editor: "#182131"
+  dark-line: "#3b4963"
+  dark-focus: "#f1b66f"
+  dark-output: "#b5caff"
+  dark-success: "#79d6a0"
+  dark-warning: "#e8ba70"
+  dark-error: "#ff9aab"
+  dark-primary-text: "#142039"
+  dark-quiet-surface: "#27334a"
+  dark-quiet-hover: "#344563"
 typography:
-  display: {fontFamily: "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", fontSize: "clamp(34px, 4vw, 58px)", fontWeight: 650, lineHeight: 1.1, letterSpacing: "-.04em"}
+  title: {fontFamily: "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", fontSize: "22px", fontWeight: 650}
   body: {fontFamily: "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"}
   code: {fontFamily: "ui-monospace, SFMono-Regular, Consolas, Liberation Mono, monospace", fontSize: "13px", lineHeight: 1.9}
 rounded:
@@ -26,7 +43,7 @@ components:
     backgroundColor: "{colors.primary}"
     textColor: "{colors.surface}"
     rounded: "{rounded.control}"
-    padding: "10px 13px"
+    padding: "8px 16px"
 ---
 
 # Design System: Loop
@@ -34,12 +51,13 @@ components:
 ## Overview
 
 **Creative North Star: "The Language-Reference Workbench"**
-Loop is a light, ink-blue workbench for writing and evaluating programs. Examples sit left, the editor center, and results right; the visual treatment stays clear and tool-like rather than promotional. Cool white surfaces, fine blue-gray dividers, restrained blue accents, and monospace code distinguish reference from editing.
-**Key Characteristics:** light cool surfaces; one three-part workbench; squared controls and border-defined panels.
+Loop is a cool-blue workbench for writing and evaluating programs, with light and dark themes. The editor sits left and results right, with examples in a compact select. Static introductions, tutorials, captions, and decorative copy are omitted; language documentation lives in the repository reference.
+**Key Characteristics:** cool surfaces; one two-part workbench; squared controls and border-defined panels.
 
 ## Colors
 
 Blue is used for actions, selection, and code emphasis; cool neutrals carry the page and panels.
+CSS `light-dark()` tokens and `color-scheme` cover every surface, control, status, focus ring, and output color. System is the default; the header select can force Light or Dark, persisted locally before the stylesheet loads. Dark mode uses slate-blue surfaces and pale blue accents, without changing layout or adding effects.
 ### Primary
 - **Ink Blue** (`{colors.primary}`): Actions, selected example, and interactive emphasis. **Code Blue** (`{colors.output}`): Lisp text and evaluated values.
 ### Neutral
@@ -56,13 +74,12 @@ Blue is used for actions, selection, and code emphasis; cool neutrals carry the 
 **Label/Mono Font:** System monospace stack
 **Character:** Compact interface labels and readable explanatory copy pair with evenly spaced monospace code.
 ### Hierarchy
-- **Display** (650, `clamp(34px, 4vw, 58px)`, 1.1): Main headline. **Title** (600, 24px, 1.25): Guide heading.
-- **Body** (400, 16px, 1.7): Introductory copy. **Label** (650, 13px): Panel headings.
+- **Title** (650, 22px): Product name. **Label** (650, 13px): Panel headings.
 - **Code** (400, 13px, 1.9): Editor text and line numbers.
 
 ## Layout
 
-Desktop is a bordered three-column grid: 205px examples, flexible editor, and results (260px minimum). At 1100px, the rail and results minimum narrow; at 800px, it becomes one column with horizontally scrolling examples. Masthead and main use 4% side margins, capped at 1500px on wide screens. Intro and guide frame the workbench.
+Desktop is a bordered two-column grid: editor and results in a 1.3:1 ratio. At 800px, it becomes one column. Masthead and main use a 94% width capped at 1500px. A compact header contains the product name, runtime status, reference, and source links.
 
 ## Elevation & Depth
 
@@ -79,14 +96,14 @@ Panels and fields are square-edged with thin borders. The primary action has a r
 - **Quiet:** Borderless muted text; hover shifts to blue and underlines. **Focus:** Offset amber outline.
 
 ### Cards / Containers
-- **Workbench:** White, thin-bordered three-column workspace; examples use a cool tint. Editor and results use dividers, not shadows.
+- **Workbench:** White, thin-bordered two-column workspace. Editor and results use dividers, not shadows.
 
 ### Inputs / Fields
 - **Editor:** Near-white code surface, monospace text, visible line numbers; focus changes surface to white.
 - **REPL:** Transparent input on a bottom rule with a blue prompt. Text fields use an inset blue focus outline.
 
 ### Navigation
-- **Examples:** Vertical list on desktop; selected item is blue with white text. Narrow screens scroll horizontally.
+- **Examples:** Native select above the editor.
 - **Source link:** Quiet text link, underlined on hover.
 
 ### Results
@@ -95,11 +112,12 @@ Panels and fields are square-edged with thin borders. The primary action has a r
 ## Do's and Don'ts
 
 ### Do:
-- **Do** keep examples left, editor center, and results right on desktop.
+- **Do** keep the program and results side by side on desktop.
 - **Do** use blue and cool neutrals to distinguish actions, content, and surfaces.
 - **Do** retain visible keyboard focus and the narrow-screen single-column workbench.
 
 ### Don't:
 - **Don't** add panel shadows; borders and tonal surfaces provide depth.
 - **Don't** turn the workbench into a marketing-style hero.
+- **Don't** add static tutorials or promotional copy to the workbench.
 - **Don't** replace code's monospace treatment with interface typography.
