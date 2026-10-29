@@ -47,6 +47,6 @@ worker is reset. Reset long-running sessions to release it.
 ## Deployment
 
 `.github/workflows/pages.yml` tests the interpreter, builds the WASM module and
-static site, and deploys `dist/` through GitHub Pages Actions. The `main` and
-initial implementation branch trigger deployment. Pages must use **GitHub
+static site, and deploys `dist/` through GitHub Pages Actions. Pushes to `main`
+trigger deployment. Pages must use **GitHub
 Actions** as its source. All assets use relative URLs for the `/loop/` base path.
