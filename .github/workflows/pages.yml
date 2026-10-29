@@ -27,8 +27,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Test WebAssembly module
-        run: node scripts/test-wasm.mjs && node scripts/test-worker.mjs && node scripts/test-browser.mjs && node scripts/test-theme.mjs
+      - name: Test site assets and WebAssembly module
+        run: node scripts/test-build.mjs && node scripts/test-wasm.mjs && node scripts/test-worker.mjs && node scripts/test-browser.mjs && node scripts/test-theme.mjs
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

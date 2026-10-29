@@ -14,6 +14,7 @@ Install Rust with rustup, then:
 rustup target add wasm32-unknown-unknown
 cargo test
 bash scripts/build.sh
+node scripts/test-build.mjs
 node scripts/test-wasm.mjs
 node scripts/test-worker.mjs
 node scripts/test-browser.mjs
@@ -241,6 +242,10 @@ source files; `input_limit` and `source_limit` expose the runtime's bounds.
 ## Deployment
 
 `.github/workflows/pages.yml` tests the interpreter, builds the WASM module and
-static site, and deploys `dist/` through GitHub Pages Actions. Pushes to `main`
+static site, and deploys `dist/` through GitHub Pages Actions. Each build places
+its CSS, JavaScript modules, worker, and WASM together under a content-addressed
+`assets/` directory. The root HTML references that version, preventing cached
+assets from an older release from breaking the new layout or runtime.
+Pushes to `main`
 trigger deployment. Pages must use **GitHub
 Actions** as its source. All assets use relative URLs for the `/loop/` base path.

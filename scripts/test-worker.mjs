@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { builtAsset } from "./built-assets.mjs";
 
-const bytes = await readFile(new URL("../dist/loop.wasm", import.meta.url));
+const bytes = await readFile(builtAsset("loop.wasm"));
 const messages = [];
 let ready;
 const initialized = new Promise((resolve) => { ready = resolve; });
@@ -14,9 +15,10 @@ globalThis.self = {
 };
 globalThis.fetch = async (url) => {
   assert.ok(url.href.endsWith("/loop.wasm"), "only the runtime may be fetched");
+  assert.equal(url.href, builtAsset("loop.wasm").href, "Worker and WASM must use the same build");
   return new Response(bytes);
 };
-await import("../web/worker.js");
+await import(builtAsset("worker.js"));
 await initialized;
 assert.equal(messages[0].inputLimit, 65_536);
 assert.equal(messages[0].sourceLimit, 128);
