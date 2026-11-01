@@ -1,5 +1,6 @@
 import { LIMITS } from "./limits.js";
 import { formatEvaluations } from "./results.js";
+import { attachCompletion } from "./completion.js";
 
 const examples = [
   { name: "Hello, Lisp", source: `; Everything starts with an expression.
@@ -60,11 +61,25 @@ const examples = [
 const $ = (id) => document.getElementById(id);
 const editor = $("editor");
 const results = $("results");
+const completion = attachCompletion($("repl"), $("repl-suggestions"));
 let worker, timer, runCount = 0, currentLabel = "";
 let runtimeState = "loading";
 let history = [], historyPosition = 0;
 const sourceFiles = new Map();
+const synchronizedSources = new Map();
+let pendingSources = new Map();
 let sourceName = "<program>", inputLimit, sourceLimit;
+let runningEditor;
+
+function storeSource(name, source) {
+  if (!sourceFiles.has(name)) {
+    const option = document.createElement("option");
+    option.value = `file:${name}`;
+    option.textContent = name;
+    $("example-list").append(option);
+  }
+  sourceFiles.set(name, source);
+}
 
 function saveSource() {
   if (sourceFiles.has(sourceName)) sourceFiles.set(sourceName, editor.value);
@@ -100,6 +115,14 @@ $("example-list").addEventListener("change", (event) => {
   updateLines();
 });
 $("open-files").addEventListener("click", () => $("source-files").click());
+$("save-file").addEventListener("click", () => {
+  const url = URL.createObjectURL(new Blob([editor.value], { type: "text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = sourceFiles.has(sourceName) ? sourceName.split(/[\\/]/).at(-1) : "program.loop";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+});
 $("source-files").addEventListener("change", async (event) => {
   const files = [...event.target.files];
   event.target.value = "";
@@ -122,13 +145,7 @@ $("source-files").addEventListener("change", async (event) => {
     if (instance !== worker) return;
     saveSource();
     for (const [name, source] of loaded) {
-      if (!sourceFiles.has(name)) {
-        const option = document.createElement("option");
-        option.value = `file:${name}`;
-        option.textContent = name;
-        $("example-list").append(option);
-      }
-      sourceFiles.set(name, source);
+      storeSource(name, source);
     }
     sourceName = loaded[0][0];
     editor.value = sourceFiles.get(sourceName);
@@ -144,26 +161,30 @@ $("source-files").addEventListener("change", async (event) => {
 
 function setRuntimeState(state, text) {
   runtimeState = state;
+  if (state !== "ready") completion.close();
   $("run").disabled = state !== "ready";
   $("repl-run").disabled = state !== "ready";
   $("open-files").disabled = state !== "ready";
   $("run").textContent = state === "running" ? "Running…" : "Run";
   $("runtime-status").textContent = text;
   const color = state === "ready" || state === "running" ? "ready" : state === "failed" ? "error" : "";
-  $("status-dot").className = `status-dot ${color}`;
+  $("status-dot").className = color === "ready" ? "fg-success" : color === "error" ? "fg-danger" : "fg-warning";
 }
 
 function addResult(text, failed, label, elapsed) {
   const entry = document.createElement("div");
-  entry.className = `result-entry${failed ? " error" : ""}`;
+  entry.className = `mb-3${failed ? " fg-danger" : ""}`;
   const heading = document.createElement("div");
-  heading.className = "result-label";
+  heading.className = `d-flex justify-content-between gap-2 small mb-2${failed ? "" : " fg-2"}`;
   const title = document.createElement("span");
+  title.className = "min-w-0 text-break";
   title.textContent = failed ? `${label} · error` : label;
   const time = document.createElement("span");
+  time.className = "flex-shrink-0";
   time.textContent = elapsed === undefined ? "" : `${elapsed.toFixed(1)} ms`;
   heading.append(title, time);
   const value = document.createElement("pre");
+  value.className = `font-monospace text-wrap text-break m-0${failed ? "" : " fg-primary"}`;
   value.textContent = text || "No expressions to evaluate.";
   entry.append(heading, value);
   results.append(entry);
@@ -183,6 +204,9 @@ function startRuntime() {
   clearTimeout(timer);
   worker?.terminate();
   worker = undefined;
+  synchronizedSources.clear();
+  pendingSources.clear();
+  completion.setSymbols([]);
   setRuntimeState("loading", "Loading…");
   let instance;
   try {
@@ -198,12 +222,28 @@ function startRuntime() {
   }, LIMITS.loadTimeoutMs);
   instance.onmessage = ({ data }) => {
     if (instance !== worker) return;
+    if (data.type === "file-written") {
+      storeSource(data.name, data.source);
+      if (sourceName === data.name && runningEditor?.name === sourceName && editor.value === runningEditor.source) {
+        editor.value = data.source;
+        runningEditor.source = data.source;
+        updateLines();
+      }
+      addResult(`${data.name} saved in the browser workspace. Select it and use Save file to download.`, false, "Write file");
+      return;
+    }
     clearTimeout(timer);
     if (data.type === "ready") {
+      completion.setSymbols(data.symbols);
       inputLimit = data.inputLimit;
       sourceLimit = data.sourceLimit;
       setRuntimeState("ready", "Ready");
     } else if (data.type === "result") {
+      completion.setSymbols(data.symbols);
+      for (const name of data.registeredSources) {
+        synchronizedSources.set(name, pendingSources.get(name));
+      }
+      pendingSources.clear();
       setRuntimeState("ready", "Ready");
       addResult(data.error ?? formatEvaluations(data.evaluations), data.error !== null, currentLabel, data.elapsed);
     } else if (data.type === "fatal") {
@@ -230,7 +270,10 @@ function evaluate(source, label, name = sourceName) {
   setRuntimeState("running", "Running…");
   currentLabel = label;
   saveSource();
-  worker.postMessage({ type: "evaluate", source, name, sources: [...sourceFiles] });
+  runningEditor = { name: sourceName, source: editor.value };
+  pendingSources = new Map([...sourceFiles].filter(([filename, contents]) =>
+    synchronizedSources.get(filename) !== contents));
+  worker.postMessage({ type: "evaluate", source, name, sources: [...pendingSources] });
   timer = setTimeout(() => {
     addResult(`Execution stopped after ${LIMITS.evaluationTimeoutMs / 1000} seconds. Definitions were cleared; try a smaller program.`, true, currentLabel);
     startRuntime();
@@ -252,6 +295,7 @@ editor.addEventListener("keydown", (event) => {
 });
 $("repl-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  completion.close();
   const source = $("repl").value;
   if (runtimeState !== "ready") return;
   evaluate(source, `λ ${source}`, "<repl>");
@@ -262,8 +306,10 @@ $("repl-form").addEventListener("submit", (event) => {
   }
 });
 $("repl").addEventListener("keydown", (event) => {
+  if (event.isComposing || completion.handleKey(event)) return;
   if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
   event.preventDefault();
+  completion.close();
   historyPosition = Math.max(0, Math.min(history.length, historyPosition + (event.key === "ArrowUp" ? -1 : 1)));
   $("repl").value = history[historyPosition] || "";
 });

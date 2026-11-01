@@ -23,8 +23,24 @@ python3 -m http.server 8000 --directory dist
 ```
 
 Open http://localhost:8000. Serve over HTTP rather than opening the HTML file
-directly: the application loads a WASM module and a module worker. There are no
-JavaScript or Rust package dependencies.
+directly: the application loads a WASM module and a module worker. No JavaScript
+package installation is needed. Rust dependencies provide JSON, XML, HTML5
+parsing and native HTTPS; versions are pinned in `Cargo.lock`.
+
+The only stylesheet is the vendored, unmodified Bootstrap **6.0.0-alpha.1**
+development snapshot from
+[`twbs/bootstrap` at `c967e2c`](https://github.com/twbs/bootstrap/tree/c967e2cbe9c30d51348fe8d42d34b84c3e7f555c).
+This is not a published Bootstrap release. Its MIT license and CSS source map
+are included beside the stylesheet. Components, layout, states, and themes use
+Bootstrap classes and `data-bs-theme`; there are no custom stylesheets or
+inline styles. System mode tracks changes to the operating system theme.
+
+The browser REPL suggests special forms and live global bindings as you type
+a symbol, including definitions and imports from the current session.
+Use Up/Down to choose, Tab or Enter to complete, Escape to dismiss, or click
+a suggestion. Completion replaces only the symbol at the caret and stays off
+inside strings and comments. With suggestions closed, Up/Down recall history.
+Resetting the session also resets its binding suggestions.
 
 ### Native CLI
 
@@ -52,7 +68,8 @@ and quotation forms. Arithmetic, comparisons, list operations,
 reference below lists every builtin and the example programs demonstrate
 the current dialect. Proper tail calls, automatic collection of unreachable
 closure cycles, named modules, and host-controlled source loading are supported.
-Macros, mutable pairs, and dotted pairs are not implemented yet.
+Lisp-style macros, uninterned generated symbols, and evaluation of quoted
+data are supported. Mutable pairs and dotted pairs are not implemented.
 
 | Category | Names |
 | --- | --- |
@@ -68,6 +85,168 @@ Macros, mutable pairs, and dotted pairs are not implemented yet.
 | Strings | `string-length string-append substring string-ref string=?` |
 | Conversion | `string->symbol symbol->string number->string string->number` |
 | Output, errors, and introspection | `display newline error symbols` |
+| Macros and evaluation | `defmacro gensym eval` |
+| Random numbers | `random random-integer random-seed!` |
+| Text files | `read-file write-file` |
+| HTTP | `http-request http-get http-head http-delete http-options http-post http-put http-patch http-status http-headers http-body` |
+| JSON | `json-parse json-stringify json-get json-set json-remove` |
+| XML and HTML | `xml-parse xml-stringify html-parse html-stringify` |
+| Markup trees | `node-tag node-attributes node-children node-text node-find node-attribute node-with-attribute node-with-children` |
+
+### Macros, quotation, and eval
+
+`quote` (or `'`) returns data without executing it. `quasiquote` (backtick)
+builds data with `unquote` (comma) and list-only `unquote-splicing` (`,@`).
+These forms work with macros and `eval` without a separate syntax language:
+
+```lisp
+(defmacro twice (expression)
+  `(+ ,expression ,expression))
+(twice 21) ; 42
+
+(defmacro once (expression &rest body)
+  (let ((temporary (gensym)))
+    `(let ((,temporary ,expression))
+       ,@body
+       ,temporary)))
+
+(eval '(+ 20 22)) ; 42
+```
+
+`defmacro` accepts a name, parameter list, and one or more body expressions.
+The optional `&rest name` must be the final parameter pair. Arguments arrive
+as unevaluated data; the transformer's result is evaluated in the caller's
+lexical scope. Transformer bodies retain their definition scope. Macros
+can be local, aliased, and explicitly exported/imported by modules, but are
+not procedures and cannot be passed to `apply` or `map`. Expansion happens at
+evaluation time, shares execution limits, and preserves call-site diagnostics.
+There is no automatic hygiene: use `gensym` for introduced binding names.
+
+`gensym` takes no arguments and returns a fresh uninterned symbol. Cloning,
+quoting, and evaluating data preserve its identity; converting its name to a
+string and back does not. Its printed `#:g...` notation is diagnostic, not a
+readable encoding of that identity.
+
+`eval` is a first-class procedure taking one datum. It evaluates in the
+session's **global** environment, not the caller's local scope. Numbers,
+booleans, strings, symbols, and lists are executable data; embedded procedure
+or macro values are rejected. Generated-code errors include `<eval>` locations.
+Tail evaluation and generated syntax remain subject to the normal step,
+depth, and list limits.
+
+### Random numbers
+
+`(random)` produces a pseudo-random number in `[0, 1)`.
+`(random-integer bound)` produces an integer from zero up to, but excluding,
+`bound`; rejection sampling avoids modulo bias. Bounds must be integers from
+1 through 2147483646. `(random-seed! seed)` accepts the same integer range,
+resets the sequence, and returns `()`.
+
+These are ordinary Lisp definitions using a private Park–Miller generator.
+Each session starts with an operating-system/browser cryptographic random seed;
+use `random-seed!` for a reproducible sequence. Library definitions share that
+state, including in modules.
+This generator is **not cryptographically secure**.
+
+### Text files and HTTP
+
+```lisp
+(write-file "answer.json" (json-stringify '(object ("answer" 42))))
+(json-get (json-parse (read-file "answer.json")) "answer") ; 42
+
+(define response
+  (http-request "POST" "https://example.com/api"
+                '(("Content-Type" "application/json"))
+                (json-stringify '(object ("message" "hello")))))
+(http-status response)
+(http-headers response)
+(http-body response)
+```
+
+`read-file` reads UTF-8 text. `write-file` replaces the file's contents and
+returns `()`. In the CLI, paths are relative to the **working directory**
+(unlike source-relative `load`), and normal filesystem permissions apply.
+The CLI executes trusted programs: these operations can write files and
+contact the network.
+
+In the browser, Open files grants access to the selected text files by
+filename. Writes create or replace files in the browser workspace; they do
+not silently modify files on disk. Select the resulting file and use
+**Save file** to download it. Opened and written files survive runtime resets
+in the page but not reloads. Files written as Lisp sources can be loaded in
+the same evaluation. Newer in-flight editor changes are not overwritten.
+File contents and HTTP request/response bodies are limited to 64 KiB.
+
+`http-request` takes an uppercase method, HTTP(S) URL, a list of string header
+pairs, and a text body. Methods are GET, POST, PUT, PATCH, DELETE, HEAD, and
+OPTIONS. GET and HEAD require an empty body. `http-get`, `http-head`, and
+`http-delete` and `http-options` take a URL; `http-post`, `http-put`, and `http-patch` take a URL
+and body. Use the generic procedure to supply headers.
+
+Responses are `(response status headers body)` data, including non-2xx
+statuses; network, TLS, timeout, and size errors raise diagnostics. Native
+requests follow at most five redirects and time out after three seconds.
+Browser requests run synchronously in the worker, use a 2.5-second network
+timeout, and remain subject to the page's execution deadline, CORS, mixed
+content, and forbidden-header rules. They never bypass browser protections.
+URLs are limited to 8192 bytes and headers to 128 pairs / 64 KiB per direction.
+Native HTTP uses Rustls with public certificate roots.
+
+Library embedders opt in through `Interpreter::set_host_handler`; no native
+file or network access exists in a bare interpreter until a handler is supplied.
+The WASM host uses explicit request/response imports, independent of source
+loading. Source files are still never fetched automatically over HTTP.
+
+### JSON, XML, and HTML data
+
+`json-parse` reads text; `json-stringify` writes it. The data representation is
+explicit, including empty containers:
+
+```lisp
+'(object ("name" "Loop") ("values" (array 1 #t null)))
+'(object) ; {}
+'(array)  ; []
+'null     ; null
+```
+
+Strings, booleans, and finite numbers use ordinary Lisp values. Numbers use
+Loop's existing `f64` representation, including its precision limits.
+`json-get` looks up an object string key or zero-based array index.
+`json-set` returns a new value with an object key added/replaced or an existing
+array item replaced. `json-remove` returns a new value with a key/item removed.
+Missing keys, invalid indexes, malformed tagged data, and duplicate object
+keys supplied to the writer raise errors; values are not mutated.
+
+XML and HTML share tagged trees:
+
+```lisp
+'(document
+   (element "p" (("id" "greeting"))
+     "Hello "
+     (element "strong" () "world")))
+```
+
+Element children follow the attribute list. Text is a string;
+comments are `(comment "text")`, processing instructions are
+`(instruction "target" "text")`, and HTML doctypes use
+`(doctype "html" "" "")`.
+`xml-parse` validates XML, decodes entities and CDATA, and rejects DTDs;
+XML declarations and lexical formatting are not preserved. Namespace
+declarations are retained for writing.
+`html-parse` uses the HTML5 tree builder, repairs malformed HTML, and inserts
+the normal `html`, `head`, and `body` nodes. Both serializers escape text and
+attributes; HTML serialization also handles void and raw-text elements.
+HTML doctype nodes retain their public and system identifiers when present.
+Trees are data, never rendered into the workbench as HTML.
+
+`node-find` returns matching elements (including the starting element) by tag
+name; `node-text` joins descendant text. `node-tag`, `node-attributes`,
+`node-children`, and `node-attribute` inspect an element.
+`node-with-attribute` adds/replaces an attribute;
+`node-with-children` replaces its children. Both return new trees.
+Parsers and serializers use the normal execution/depth/list limits and a
+128 KiB text bound; serialization normalizes formatting rather than preserving
+source bytes.
 
 Numbers are 64-bit floats. Only `#f` is false. Strings support `\n`, `\t`,
 `\"`, and `\\` escapes; comments begin with `;`. Quoting (`'(1 2 3)`)
@@ -220,10 +399,24 @@ flags. Resource limits are named constants in `src/lib.rs`; the WASM
 `input_limit()` export supplies the browser's input bound. Browser-only
 timeouts and result-history limits live in `web/limits.js`.
 
+The reader builds an `Expr` tree with source locations, separate from runtime
+`Value` data. Procedure bodies retain expressions; quoting converts expressions
+to immutable data. Runtime values never carry syntax wrappers.
+
+Rust errors are `Diagnostic` values with a message, an `ErrorKind`, and bounded
+`TraceFrame` entries containing structured source locations. Incomplete reader
+input has its own kind, so the terminal REPL does not inspect error wording.
+Diagnostics are formatted only at CLI and WASM presentation boundaries.
+The host source-loader callback can still return ordinary string errors.
+
+One typed builtin registry owns each builtin procedure's name, argument-count rule,
+and implementation handler. It supplies both global bindings and dispatch,
+including tail calls through `apply`; aliases retain their existing semantics.
+
 The public Rust `Interpreter` API provides `execute`, `execute_named`,
 `register_source`, and an optional host source-loader callback. Returned
 `Evaluation` entries expose their Lisp notation through `value()` and captured
-text through `output`. The core has no filesystem or network dependency;
+text through `output`. The core performs no filesystem or network IO without a configured host;
 only the CLI installs a filesystem loader.
 
 Execution returns a value and captured output for each top-level expression,
@@ -238,6 +431,20 @@ of `loading`, `ready`, `running`, or `failed`, with both evaluation controls
 derived from that state. `source_name_buffer`, `evaluate_named`, and
 `register_source` extend the WASM ABI for named programs and user-selected
 source files; `input_limit` and `source_limit` expose the runtime's bounds.
+All three WASM request entrypoints share decoding, operation dispatch, response
+serialization, and status handling. Their exported signatures and JSON response
+shape remain unchanged.
+
+The browser sends only new or edited source files before an evaluation.
+The worker acknowledges each successful registration, including partial
+success before an error; unacknowledged files are retried. Unchanged files are
+not retransmitted. Reset, timeout, or worker replacement clears synchronization
+state so all opened files are sent to the new runtime on its next evaluation.
+The `completion_symbols` WASM export writes a JSON array of global names to
+the output buffer without evaluating code. The worker refreshes suggestions
+on initialization and after each request, including requests that fail after
+creating bindings. Completion does not depend on the user-visible `symbols`
+binding retaining its original value.
 
 ## Deployment
 

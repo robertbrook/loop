@@ -3,10 +3,101 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     rc::{Rc, Weak},
+    sync::atomic::{AtomicUsize, Ordering},
 };
+mod data;
+mod host;
+pub use host::{HostRequest, HostResponse, HOST_TEXT_LIMIT};
+
+fn random_seed() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[link(wasm_import_module = "env")]
+        unsafe extern "C" {
+            fn loop_random_seed() -> u32;
+        }
+        unsafe { loop_random_seed() as u64 }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut bytes = [0; 4];
+        getrandom::getrandom(&mut bytes).expect("system random source unavailable");
+        u32::from_ne_bytes(bytes) as u64
+    }
+}
 
 type Env = Rc<RefCell<Scope>>;
-type Result<T> = std::result::Result<T, String>;
+type Result<T> = std::result::Result<T, Diagnostic>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Runtime,
+    IncompleteInput,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceFrame {
+    pub location: Location,
+    pub context: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Diagnostic {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub trace: Vec<TraceFrame>,
+}
+
+impl Diagnostic {
+    fn incomplete(message: &str) -> Self {
+        Self {
+            kind: ErrorKind::IncompleteInput,
+            ..message.into()
+        }
+    }
+
+    fn at(mut self, location: &Location, context: &str) -> Self {
+        if self.trace.len() < 12 {
+            self.trace.push(TraceFrame {
+                location: location.clone(),
+                context: context.into(),
+            });
+        }
+        self
+    }
+}
+
+impl From<String> for Diagnostic {
+    fn from(message: String) -> Self {
+        Self {
+            kind: ErrorKind::Runtime,
+            message,
+            trace: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for Diagnostic {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)?;
+        for frame in &self.trace {
+            write!(
+                f,
+                "\n  at {}:{}:{}{}",
+                frame.location.source, frame.location.line, frame.location.column, frame.context
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Diagnostic {}
 
 pub const INPUT_LIMIT: usize = limits::INPUT_BYTES;
 
@@ -19,69 +110,135 @@ mod limits {
     pub const SOURCE_FILES: usize = 128;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Symbol(Rc<SymbolName>);
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SymbolName {
+    name: String,
+    identity: Option<usize>,
+}
+
+impl std::ops::Deref for Symbol {
+    type Target = SymbolName;
+
+    fn deref(&self) -> &SymbolName {
+        &self.0
+    }
+}
+
+impl Symbol {
+    fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    fn is(&self, name: &str) -> bool {
+        self.identity.is_none() && self.name == name
+    }
+}
+
+impl From<String> for Symbol {
+    fn from(name: String) -> Self {
+        Self(Rc::new(SymbolName {
+            name,
+            identity: None,
+        }))
+    }
+}
+
+impl From<&str> for Symbol {
+    fn from(name: &str) -> Self {
+        name.to_string().into()
+    }
+}
+
+impl fmt::Display for Symbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.identity.is_some() {
+            f.write_str("#:")?;
+        }
+        f.write_str(&self.name)
+    }
+}
+
 #[derive(Clone)]
 enum Value {
     Number(f64),
     Bool(bool),
     Text(String),
-    Symbol(String),
+    Symbol(Symbol),
     List(Vec<Value>),
     Function(Rc<Procedure>),
-    Builtin(String),
+    Macro(Rc<Procedure>),
+    Builtin(Builtin),
     Uninitialized,
-    Syntax(Box<Value>, Location),
 }
 
 struct Procedure {
-    params: Vec<String>,
-    body: Vec<Value>,
+    params: Vec<Symbol>,
+    rest: Option<Symbol>,
+    body: Vec<Expr>,
     env: Env,
 }
 
-fn procedure(params: Vec<String>, body: Vec<Value>, env: Env) -> Value {
-    Value::Function(Rc::new(Procedure { params, body, env }))
+fn procedure(params: Vec<Symbol>, body: Vec<Expr>, env: Env) -> Value {
+    Value::Function(Rc::new(Procedure {
+        params,
+        rest: None,
+        body,
+        env,
+    }))
 }
 
 #[derive(Clone, Debug)]
-struct Location {
-    source: Rc<str>,
-    line: usize,
-    column: usize,
+pub struct Location {
+    pub source: Rc<str>,
+    pub line: usize,
+    pub column: usize,
 }
 
 impl Location {
-    fn error(&self, message: String) -> String {
-        self.context(message, "")
-    }
-
-    fn context(&self, message: String, context: &str) -> String {
-        if message
-            .lines()
-            .filter(|line| line.starts_with("  at "))
-            .count()
-            >= 12
-        {
-            return message;
-        }
-        format!(
-            "{message}\n  at {}:{}:{}{context}",
-            self.source, self.line, self.column
-        )
+    fn error(&self, error: impl Into<Diagnostic>) -> Diagnostic {
+        error.into().at(self, "")
     }
 }
 
-impl Value {
-    fn datum(&self) -> &Self {
-        match self {
-            Self::Syntax(value, _) => value.datum(),
-            _ => self,
+#[derive(Clone)]
+struct Expr {
+    kind: ExprKind,
+    location: Option<Location>,
+}
+
+#[derive(Clone)]
+enum ExprKind {
+    Number(f64),
+    Bool(bool),
+    Text(String),
+    Symbol(Symbol),
+    List(Vec<Expr>),
+}
+
+impl Expr {
+    fn generated(kind: ExprKind) -> Self {
+        Self {
+            kind,
+            location: None,
         }
     }
+    fn list(items: Vec<Self>) -> Self {
+        Self::generated(ExprKind::List(items))
+    }
+    fn symbol(name: Symbol) -> Self {
+        Self::generated(ExprKind::Symbol(name))
+    }
 
-    fn quoted(&self) -> Self {
-        match self.datum() {
-            Self::List(items) => Self::List(items.iter().map(Self::quoted).collect()),
-            value => value.clone(),
+    fn quoted(&self) -> Value {
+        match &self.kind {
+            ExprKind::Number(n) => Value::Number(*n),
+            ExprKind::Bool(b) => Value::Bool(*b),
+            ExprKind::Text(s) => Value::Text(s.clone()),
+            ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+            ExprKind::List(items) => Value::List(items.iter().map(Self::quoted).collect()),
         }
     }
 }
@@ -104,15 +261,15 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Self::Function(..) => write!(f, "#<procedure>"),
-            Self::Builtin(name) => write!(f, "#<builtin:{name}>"),
+            Self::Macro(..) => write!(f, "#<macro>"),
+            Self::Builtin(builtin) => write!(f, "#<builtin:{}>", builtin.name()),
             Self::Uninitialized => write!(f, "#<uninitialized>"),
-            Self::Syntax(value, _) => write!(f, "{value}"),
         }
     }
 }
 
 struct Scope {
-    values: HashMap<String, Value>,
+    values: HashMap<Symbol, Value>,
     parent: Option<Env>,
 }
 
@@ -123,25 +280,25 @@ fn scope(parent: Option<Env>) -> Env {
     }))
 }
 
-fn lookup(env: &Env, name: &str) -> Result<Value> {
+fn lookup(env: &Env, name: &Symbol) -> Result<Value> {
     let current = env.borrow();
     if let Some(value) = current.values.get(name) {
         if matches!(value, Value::Uninitialized) {
-            return Err(format!("Uninitialized binding: {name}"));
+            return Err(format!("Uninitialized binding: {name}").into());
         }
         return Ok(value.clone());
     }
     match &current.parent {
         Some(parent) => lookup(parent, name),
-        None => Err(format!("Unknown symbol: {name}")),
+        None => Err(format!("Unknown symbol: {name}").into()),
     }
 }
 
-fn assign(env: &Env, name: &str, value: Value) -> Result<()> {
+fn assign(env: &Env, name: &Symbol, value: Value) -> Result<()> {
     let mut current = env.borrow_mut();
     if let Some(binding) = current.values.get_mut(name) {
         if matches!(binding, Value::Uninitialized) {
-            return Err(format!("Uninitialized binding: {name}"));
+            return Err(format!("Uninitialized binding: {name}").into());
         }
         *binding = value;
         return Ok(());
@@ -150,7 +307,7 @@ fn assign(env: &Env, name: &str, value: Value) -> Result<()> {
     drop(current);
     match parent {
         Some(parent) => assign(&parent, name, value),
-        None => Err(format!("Cannot set! unknown symbol: {name}")),
+        None => Err(format!("Cannot set! unknown symbol: {name}").into()),
     }
 }
 
@@ -232,15 +389,18 @@ fn tokenize(source: &str, name: &str) -> Result<Vec<LocatedToken>> {
                             Some((_, other)) => {
                                 return Err(location.error(format!("Unknown escape: \\{other}")))
                             }
-                            None => return Err(location.error("Unfinished string escape".into())),
+                            None => {
+                                return Err(location
+                                    .error(Diagnostic::incomplete("Unfinished string escape")))
+                            }
                         }),
                         _ => text.push(c),
                     }
                 }
                 if !closed {
-                    return Err(
-                        location.error("Unclosed string: add a closing double quote".into())
-                    );
+                    return Err(location.error(Diagnostic::incomplete(
+                        "Unclosed string: add a closing double quote",
+                    )));
                 }
                 Token::Text(text)
             }
@@ -260,11 +420,13 @@ fn tokenize(source: &str, name: &str) -> Result<Vec<LocatedToken>> {
     Ok(tokens)
 }
 
-fn parse(tokens: &[LocatedToken], pos: &mut usize, depth: usize) -> Result<Value> {
+fn parse(tokens: &[LocatedToken], pos: &mut usize, depth: usize) -> Result<Expr> {
     if depth > limits::DEPTH {
         return Err("Reader nesting limit reached".into());
     }
-    let located = tokens.get(*pos).ok_or("Expected an expression")?;
+    let located = tokens
+        .get(*pos)
+        .ok_or_else(|| Diagnostic::incomplete("Expected an expression"))?;
     let token = &located.token;
     *pos += 1;
     let result = (|| match token {
@@ -272,10 +434,14 @@ fn parse(tokens: &[LocatedToken], pos: &mut usize, depth: usize) -> Result<Value
             let mut list = Vec::new();
             loop {
                 match tokens.get(*pos).map(|t| &t.token) {
-                    None => return Err("Unclosed list: add a closing parenthesis".into()),
+                    None => {
+                        return Err(Diagnostic::incomplete(
+                            "Unclosed list: add a closing parenthesis",
+                        ))
+                    }
                     Some(Token::Close) => {
                         *pos += 1;
-                        return Ok(Value::List(list));
+                        return Ok(ExprKind::List(list));
                     }
                     _ => {
                         if list.len() >= limits::LIST_ITEMS {
@@ -294,25 +460,28 @@ fn parse(tokens: &[LocatedToken], pos: &mut usize, depth: usize) -> Result<Value
                 Token::Unquote => "unquote",
                 _ => "unquote-splicing",
             };
-            Ok(Value::List(vec![
-                Value::Symbol(name.into()),
+            Ok(ExprKind::List(vec![
+                Expr::symbol(name.into()),
                 parse(tokens, pos, depth + 1)?,
             ]))
         }
-        Token::Text(s) => Ok(Value::Text(s.clone())),
+        Token::Text(s) => Ok(ExprKind::Text(s.clone())),
         Token::Atom(s) => Ok(match s.as_str() {
-            "#t" => Value::Bool(true),
-            "#f" => Value::Bool(false),
+            "#t" => ExprKind::Bool(true),
+            "#f" => ExprKind::Bool(false),
             _ => match s.parse::<f64>() {
-                Ok(n) if n.is_finite() => Value::Number(n),
-                _ => Value::Symbol(s.clone()),
+                Ok(n) if n.is_finite() => ExprKind::Number(n),
+                _ => ExprKind::Symbol(s.clone().into()),
             },
         }),
     })();
     result
-        .map(|value| Value::Syntax(Box::new(value), located.location.clone()))
-        .map_err(|error: String| {
-            if error.contains("\n  at ") {
+        .map(|kind| Expr {
+            kind,
+            location: Some(located.location.clone()),
+        })
+        .map_err(|error: Diagnostic| {
+            if !error.trace.is_empty() {
                 error
             } else {
                 located.location.error(error)
@@ -320,27 +489,24 @@ fn parse(tokens: &[LocatedToken], pos: &mut usize, depth: usize) -> Result<Value
         })
 }
 
-fn arity(name: &str, values: &[Value], count: usize) -> Result<()> {
+fn arity<T>(name: &str, values: &[T], count: usize) -> Result<()> {
     if values.len() == count {
         Ok(())
     } else {
-        Err(format!(
-            "{name} expects {count} argument(s), got {}",
-            values.len()
-        ))
+        Err(format!("{name} expects {count} argument(s), got {}", values.len()).into())
     }
 }
 
-fn symbol(value: &Value) -> Result<String> {
-    if let Value::Symbol(s) = value.datum() {
+fn symbol(value: &Expr) -> Result<Symbol> {
+    if let ExprKind::Symbol(s) = &value.kind {
         Ok(s.clone())
     } else {
         Err("Expected a symbol".into())
     }
 }
 
-fn parameters(value: &Value) -> Result<Vec<String>> {
-    if let Value::List(items) = value.datum() {
+fn parameters(value: &Expr) -> Result<Vec<Symbol>> {
+    if let ExprKind::List(items) = &value.kind {
         let names = items.iter().map(symbol).collect::<Result<Vec<_>>>()?;
         let mut unique = std::collections::HashSet::new();
         if names.iter().any(|name| !unique.insert(name)) {
@@ -356,28 +522,30 @@ fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
 }
 
-fn is_symbol(value: &Value, name: &str) -> bool {
-    matches!(value.datum(), Value::Symbol(s) if s == name)
+fn is_symbol(value: &Expr, name: &str) -> bool {
+    matches!(&value.kind, ExprKind::Symbol(s) if s.is(name))
 }
 
 fn datum_equal(left: &Value, right: &Value) -> bool {
-    match (left.datum(), right.datum()) {
+    match (left, right) {
         (Value::Number(a), Value::Number(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Text(a), Value::Text(b)) | (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Text(a), Value::Text(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::List(a), Value::List(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| datum_equal(a, b))
         }
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+        (Value::Macro(a), Value::Macro(b)) => Rc::ptr_eq(a, b),
         (Value::Builtin(a), Value::Builtin(b)) => a == b,
         _ => false,
     }
 }
 
 struct Binding<'a> {
-    name: String,
-    initial: &'a Value,
-    step: Option<&'a Value>,
+    name: Symbol,
+    initial: &'a Expr,
+    step: Option<&'a Expr>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -399,15 +567,15 @@ impl fmt::Display for BindingForm {
     }
 }
 
-fn bindings(value: &Value, form: BindingForm) -> Result<Vec<Binding<'_>>> {
-    let Value::List(items) = value.datum() else {
-        return Err(format!("{form} expects a binding list"));
+fn bindings(value: &Expr, form: BindingForm) -> Result<Vec<Binding<'_>>> {
+    let ExprKind::List(items) = &value.kind else {
+        return Err(format!("{form} expects a binding list").into());
     };
     let mut names = std::collections::HashSet::new();
     let mut result = Vec::new();
     for item in items {
-        let Value::List(parts) = item.datum() else {
-            return Err(format!("{form} expects (name value) bindings"));
+        let ExprKind::List(parts) = &item.kind else {
+            return Err(format!("{form} expects (name value) bindings").into());
         };
         if parts.len() != 2 && !(form == BindingForm::Do && parts.len() == 3) {
             return Err(format!(
@@ -417,11 +585,12 @@ fn bindings(value: &Value, form: BindingForm) -> Result<Vec<Binding<'_>>> {
                 } else {
                     ""
                 }
-            ));
+            )
+            .into());
         }
         let name = symbol(&parts[0])?;
         if !names.insert(name.clone()) && form != BindingForm::LetStar {
-            return Err(format!("Duplicate {form} binding: {name}"));
+            return Err(format!("Duplicate {form} binding: {name}").into());
         }
         result.push(Binding {
             name,
@@ -449,14 +618,14 @@ impl fmt::Display for ClauseForm {
 
 enum ClauseTest<'a> {
     Else,
-    Expression(&'a Value),
-    Datums(&'a [Value]),
+    Expression(&'a Expr),
+    Datums(&'a [Expr]),
 }
 
 enum ClauseBody<'a> {
     TestValue,
-    Sequence(&'a [Value]),
-    Recipient(&'a Value),
+    Sequence(&'a [Expr]),
+    Recipient(&'a Expr),
 }
 
 struct Clause<'a> {
@@ -464,33 +633,33 @@ struct Clause<'a> {
     body: ClauseBody<'a>,
 }
 
-fn clauses(args: &[Value], form: ClauseForm) -> Result<Vec<Clause<'_>>> {
+fn clauses(args: &[Expr], form: ClauseForm) -> Result<Vec<Clause<'_>>> {
     let mut clauses = Vec::new();
     for (i, arg) in args.iter().enumerate() {
-        let Value::List(parts) = arg.datum() else {
-            return Err(format!("{form} expects clause lists"));
+        let ExprKind::List(parts) = &arg.kind else {
+            return Err(format!("{form} expects clause lists").into());
         };
         let Some(test) = parts.first() else {
-            return Err(format!("{form} clause cannot be empty"));
+            return Err(format!("{form} clause cannot be empty").into());
         };
         let otherwise = is_symbol(test, "else");
         if otherwise && (i + 1 != args.len() || parts.len() == 1) {
-            return Err(format!("{form} else clause must be last and have a body"));
+            return Err(format!("{form} else clause must be last and have a body").into());
         }
         if form == ClauseForm::Case
             && !otherwise
-            && (!matches!(test.datum(), Value::List(_)) || parts.len() < 2)
+            && (!matches!(&test.kind, ExprKind::List(_)) || parts.len() < 2)
         {
             return Err("case clause needs a datum list and a body".into());
         }
         if parts.get(1).is_some_and(|v| is_symbol(v, "=>"))
             && (parts.len() != 3 || (form == ClauseForm::Cond && otherwise))
         {
-            return Err(format!("{form} => clause needs a test and one recipient"));
+            return Err(format!("{form} => clause needs a test and one recipient").into());
         }
-        let test = match (otherwise, form, test.datum()) {
+        let test = match (otherwise, form, &test.kind) {
             (true, _, _) => ClauseTest::Else,
-            (false, ClauseForm::Case, Value::List(datums)) => ClauseTest::Datums(datums),
+            (false, ClauseForm::Case, ExprKind::List(datums)) => ClauseTest::Datums(datums),
             _ => ClauseTest::Expression(test),
         };
         let body = if parts.len() == 1 {
@@ -505,27 +674,27 @@ fn clauses(args: &[Value], form: ClauseForm) -> Result<Vec<Clause<'_>>> {
     Ok(clauses)
 }
 
-fn form(name: &str, args: Vec<Value>) -> Value {
-    let mut items = vec![Value::Symbol(name.into())];
+fn form(name: &str, args: Vec<Expr>) -> Expr {
+    let mut items = vec![Expr::symbol(name.into())];
     items.extend(args);
-    Value::List(items)
+    Expr::list(items)
 }
 
-fn expand_let(bindings: &[Binding<'_>], body: &[Value]) -> Value {
-    let params = Value::List(
+fn expand_let(bindings: &[Binding<'_>], body: &[Expr]) -> Expr {
+    let params = Expr::list(
         bindings
             .iter()
-            .map(|b| Value::Symbol(b.name.clone()))
+            .map(|b| Expr::symbol(b.name.clone()))
             .collect(),
     );
     let mut lambda = vec![params];
     lambda.extend_from_slice(body);
     let mut call = vec![form("lambda", lambda)];
     call.extend(bindings.iter().map(|b| b.initial.clone()));
-    Value::List(call)
+    Expr::list(call)
 }
 
-fn expand_let_star(bindings: &[Binding<'_>], body: &[Value]) -> Result<Value> {
+fn expand_let_star(bindings: &[Binding<'_>], body: &[Expr]) -> Result<Expr> {
     // Bound generated nesting before constructing an owned recursive syntax tree.
     if bindings.len() > limits::DEPTH {
         return Err("Call depth limit reached. Try a smaller input.".into());
@@ -551,19 +720,125 @@ impl Evaluation {
 
 enum Step {
     Value(Value),
-    Eval(Value, Env),
+    Eval(Expr, Env),
     Call(Value, Vec<Value>),
 }
 
-type SourceLoader = dyn FnMut(&str, &str) -> Result<(String, String)>;
+#[derive(Clone, Copy)]
+enum Arguments {
+    Any,
+    Exact(usize),
+    AtLeast(usize, &'static str),
+}
+
+impl Arguments {
+    fn check(self, name: &str, values: &[Value]) -> Result<()> {
+        match self {
+            Self::Exact(count) => arity(name, values, count),
+            Self::AtLeast(count, message) if values.len() < count => {
+                Err(format!("{name} {message}").into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+macro_rules! builtins {
+    ($($variant:ident => $name:literal, $arguments:expr, $handler:ident;)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Builtin { $($variant,)* }
+
+        impl Builtin {
+            const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
+            fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name,)* }
+            }
+
+            fn arguments(self) -> Arguments {
+                match self { $(Self::$variant => $arguments,)* }
+            }
+
+            fn call(self, runtime: &mut Interpreter, args: Vec<Value>, depth: usize) -> Result<Step> {
+                match self { $(Self::$variant => runtime.$handler(self, args, depth),)* }
+            }
+        }
+    };
+}
+
+use Arguments::{Any, AtLeast, Exact};
+use Builtin::*;
+
+builtins! {
+    Add => "+", Any, numeric;
+    Subtract => "-", AtLeast(1, "needs at least one number"), numeric;
+    Multiply => "*", Any, numeric;
+    Divide => "/", AtLeast(1, "needs at least one number"), numeric;
+    NumericEqual => "=", AtLeast(2, "needs at least two numbers"), numeric;
+    Less => "<", AtLeast(2, "needs at least two numbers"), numeric;
+    Greater => ">", AtLeast(2, "needs at least two numbers"), numeric;
+    LessEqual => "<=", AtLeast(2, "needs at least two numbers"), numeric;
+    GreaterEqual => ">=", AtLeast(2, "needs at least two numbers"), numeric;
+    Modulo => "modulo", Exact(2), numeric;
+    Abs => "abs", Exact(1), numeric;
+    Symbols => "symbols", Exact(0), symbols;
+    List => "list", Any, make_list;
+    Equal => "equal?", Exact(2), equality;
+    Eq => "eq?", Exact(2), equality;
+    Not => "not", Exact(1), predicate;
+    Null => "null?", Exact(1), predicate;
+    IsNumber => "number?", Exact(1), predicate;
+    IsList => "list?", Exact(1), predicate;
+    IsBoolean => "boolean?", Exact(1), predicate;
+    IsString => "string?", Exact(1), predicate;
+    IsSymbol => "symbol?", Exact(1), predicate;
+    IsProcedure => "procedure?", Exact(1), predicate;
+    StringLength => "string-length", Exact(1), string_builtin;
+    StringAppend => "string-append", Any, string_builtin;
+    Substring => "substring", Exact(3), string_builtin;
+    StringRef => "string-ref", Exact(2), string_builtin;
+    StringEqual => "string=?", AtLeast(2, "needs at least two strings"), string_builtin;
+    StringToSymbol => "string->symbol", Exact(1), string_builtin;
+    SymbolToString => "symbol->string", Exact(1), string_builtin;
+    NumberToString => "number->string", Exact(1), string_builtin;
+    StringToNumber => "string->number", Exact(1), string_builtin;
+    Error => "error", AtLeast(1, "needs a message string and optional values"), raise_error;
+    Car => "car", Exact(1), list_access;
+    Cdr => "cdr", Exact(1), list_access;
+    Length => "length", Exact(1), list_access;
+    Cons => "cons", Exact(2), combine_lists;
+    Append => "append", Exact(2), combine_lists;
+    Display => "display", Exact(1), display;
+    Newline => "newline", Exact(0), newline;
+    Map => "map", Exact(2), transform_list;
+    Filter => "filter", Exact(2), transform_list;
+    Apply => "apply", Exact(2), apply;
+    Eval => "eval", Exact(1), eval_datum;
+    Gensym => "gensym", Exact(0), gensym;
+    ReadFile => "read-file", Exact(1), host_builtin;
+    WriteFile => "write-file", Exact(2), host_builtin;
+    HttpRequest => "http-request", Exact(4), host_builtin;
+    JsonParse => "json-parse", Exact(1), data_builtin;
+    JsonStringify => "json-stringify", Exact(1), data_builtin;
+    JsonGet => "json-get", Exact(2), data_builtin;
+    JsonSet => "json-set", Exact(3), data_builtin;
+    JsonRemove => "json-remove", Exact(2), data_builtin;
+    XmlParse => "xml-parse", Exact(1), data_builtin;
+    XmlStringify => "xml-stringify", Exact(1), data_builtin;
+    HtmlParse => "html-parse", Exact(1), data_builtin;
+    HtmlStringify => "html-stringify", Exact(1), data_builtin;
+}
+
+type SourceLoader = dyn FnMut(&str, &str) -> std::result::Result<(String, String), String>;
 
 pub struct Interpreter {
     env: Env,
     prelude: Env,
     scopes: Vec<Weak<RefCell<Scope>>>,
-    modules: HashMap<String, HashMap<String, Value>>,
+    modules: HashMap<Symbol, HashMap<Symbol, Value>>,
     sources: HashMap<String, String>,
     loader: Option<Box<SourceLoader>>,
+    host: Option<host::Handler>,
     loading: Vec<String>,
     steps: usize,
     output: String,
@@ -573,69 +848,51 @@ pub struct Interpreter {
 impl Interpreter {
     pub fn new() -> Self {
         let env = scope(None);
-        for name in [
-            "+",
-            "-",
-            "*",
-            "/",
-            "=",
-            "<",
-            ">",
-            "<=",
-            ">=",
-            "not",
-            "list",
-            "car",
-            "cdr",
-            "cons",
-            "append",
-            "length",
-            "null?",
-            "number?",
-            "list?",
-            "display",
-            "newline",
-            "map",
-            "filter",
-            "apply",
-            "modulo",
-            "abs",
-            "symbols",
-            "equal?",
-            "eq?",
-            "boolean?",
-            "string?",
-            "symbol?",
-            "procedure?",
-            "string-length",
-            "string-append",
-            "substring",
-            "string-ref",
-            "string=?",
-            "string->symbol",
-            "symbol->string",
-            "number->string",
-            "string->number",
-            "error",
-        ] {
+        for &builtin in Builtin::ALL {
             env.borrow_mut()
                 .values
-                .insert(name.into(), Value::Builtin(name.into()));
+                .insert(builtin.name().into(), Value::Builtin(builtin));
         }
         let prelude = scope(None);
         prelude.borrow_mut().values = env.borrow().values.clone();
-        Self {
+        let mut runtime = Self {
             scopes: vec![Rc::downgrade(&env), Rc::downgrade(&prelude)],
             env,
             prelude,
             modules: HashMap::new(),
             sources: HashMap::new(),
             loader: None,
+            host: host::default_handler(),
             loading: Vec::new(),
             steps: 0,
             output: String::new(),
             output_bytes: 0,
+        };
+        let library = runtime.scope(Some(runtime.prelude.clone()));
+        for expression in
+            Self::read(include_str!("prelude.loop"), "<prelude>").expect("valid bundled prelude")
+        {
+            runtime
+                .eval(&expression, library.clone(), 0)
+                .expect("bundled prelude initialization");
         }
+        let seed = random_seed() % 2_147_483_646 + 1;
+        let seed_expression = Self::read(&format!("(random-seed! {seed})"), "<prelude>")
+            .expect("generated random seed is valid");
+        runtime
+            .eval(&seed_expression[0], library.clone(), 0)
+            .expect("bundled random seed initialization");
+        let definitions = library.borrow().values.clone();
+        runtime.env.borrow_mut().values.extend(definitions.clone());
+        runtime.prelude.borrow_mut().values.extend(definitions);
+        runtime.collect(&[]);
+        runtime.steps = 0;
+        #[cfg(target_arch = "wasm32")]
+        runtime.set_source_loader(|path, _caller| {
+            let response = host::wasm_request(HostRequest::ReadFile { path: path.into() })?;
+            Ok((path.into(), response.body))
+        });
+        runtime
     }
 
     pub fn register_source(&mut self, name: &str, source: &str) -> Result<()> {
@@ -656,7 +913,7 @@ impl Interpreter {
 
     pub fn set_source_loader(
         &mut self,
-        loader: impl FnMut(&str, &str) -> Result<(String, String)> + 'static,
+        loader: impl FnMut(&str, &str) -> std::result::Result<(String, String), String> + 'static,
     ) {
         self.loader = Some(Box::new(loader));
     }
@@ -670,13 +927,14 @@ impl Interpreter {
     fn collect(&mut self, roots: &[Evaluation]) {
         fn trace_value(value: &Value, pending: &mut Vec<Env>) {
             match value {
-                Value::Function(function) => pending.push(function.env.clone()),
+                Value::Function(function) | Value::Macro(function) => {
+                    pending.push(function.env.clone())
+                }
                 Value::List(items) => {
                     for item in items {
                         trace_value(item, pending);
                     }
                 }
-                Value::Syntax(value, _) => trace_value(value, pending),
                 _ => {}
             }
         }
@@ -720,12 +978,9 @@ impl Interpreter {
     }
 
     pub fn is_incomplete(source: &str) -> bool {
-        Self::read(source, "<input>").err().is_some_and(|error| {
-            error.starts_with("Unclosed list")
-                || error.starts_with("Unclosed string")
-                || error.starts_with("Expected an expression")
-                || error.starts_with("Unfinished string escape")
-        })
+        Self::read(source, "<input>")
+            .err()
+            .is_some_and(|error| error.kind == ErrorKind::IncompleteInput)
     }
 
     pub fn execute_named(&mut self, source: &str, name: &str) -> Result<Vec<Evaluation>> {
@@ -744,7 +999,7 @@ impl Interpreter {
         result
     }
 
-    fn read(source: &str, name: &str) -> Result<Vec<Value>> {
+    fn read(source: &str, name: &str) -> Result<Vec<Expr>> {
         if source.len() > limits::INPUT_BYTES {
             return Err("Program exceeds the 64 KiB input limit".into());
         }
@@ -796,7 +1051,7 @@ impl Interpreter {
         Ok(())
     }
 
-    fn sequence(&mut self, body: &[Value], env: Env, depth: usize) -> Result<Step> {
+    fn sequence(&mut self, body: &[Expr], env: Env, depth: usize) -> Result<Step> {
         let Some((last, before)) = body.split_last() else {
             return Ok(Step::Value(Value::List(vec![])));
         };
@@ -806,21 +1061,23 @@ impl Interpreter {
         Ok(Step::Eval(last.clone(), env))
     }
 
-    fn quasiquote(&mut self, value: &Value, level: usize, env: Env, depth: usize) -> Result<Value> {
+    fn quasiquote(&mut self, value: &Expr, level: usize, env: Env, depth: usize) -> Result<Value> {
         self.tick(depth)?;
-        let Value::List(items) = value.datum() else {
+        let ExprKind::List(items) = &value.kind else {
             return Ok(value.quoted());
         };
-        if let Some(Value::Symbol(name)) = items.first().map(Value::datum) {
-            if ["quasiquote", "unquote", "unquote-splicing"].contains(&name.as_str()) {
-                arity(name, &items[1..], 1)?;
-                if name == "unquote" && level == 1 {
+        if let Some(ExprKind::Symbol(name)) = items.first().map(|item| &item.kind) {
+            if name.identity.is_none()
+                && ["quasiquote", "unquote", "unquote-splicing"].contains(&name.as_str())
+            {
+                arity(name.as_str(), &items[1..], 1)?;
+                if name.is("unquote") && level == 1 {
                     return self.eval(&items[1], env, depth + 1);
                 }
-                if name == "unquote-splicing" && level == 1 {
+                if name.is("unquote-splicing") && level == 1 {
                     return Err("unquote-splicing is only valid inside a quasiquoted list".into());
                 }
-                let next_level = if name == "quasiquote" {
+                let next_level = if name.is("quasiquote") {
                     level + 1
                 } else {
                     level - 1
@@ -833,7 +1090,7 @@ impl Interpreter {
         }
         let mut result = Vec::new();
         for item in items {
-            if let Value::List(parts) = item.datum() {
+            if let ExprKind::List(parts) = &item.kind {
                 if level == 1
                     && parts
                         .first()
@@ -861,14 +1118,14 @@ impl Interpreter {
     fn eval_let(
         &mut self,
         form: BindingForm,
-        args: &[Value],
+        args: &[Expr],
         env: Env,
         depth: usize,
     ) -> Result<Step> {
         if args.len() < 2 {
-            return Err(format!("{form} needs bindings and a body"));
+            return Err(format!("{form} needs bindings and a body").into());
         }
-        let named = form == BindingForm::Let && matches!(args[0].datum(), Value::Symbol(_));
+        let named = form == BindingForm::Let && matches!(&args[0].kind, ExprKind::Symbol(_));
         let offset = usize::from(named);
         if args.len() < offset + 2 {
             return Err("Named let needs a name, bindings, and a body".into());
@@ -920,7 +1177,7 @@ impl Interpreter {
     fn eval_clauses(
         &mut self,
         form: ClauseForm,
-        args: &[Value],
+        args: &[Expr],
         env: Env,
         depth: usize,
     ) -> Result<Step> {
@@ -946,7 +1203,7 @@ impl Interpreter {
                 }
                 ClauseTest::Datums(datums) => {
                     let key = key.as_ref().expect("case clauses have a key");
-                    if !datums.iter().any(|datum| datum_equal(datum, key)) {
+                    if !datums.iter().any(|datum| datum_equal(&datum.quoted(), key)) {
                         continue;
                     }
                     key.clone()
@@ -964,12 +1221,12 @@ impl Interpreter {
         Ok(Step::Value(Value::List(vec![])))
     }
 
-    fn eval_do(&mut self, args: &[Value], env: Env, depth: usize) -> Result<Step> {
+    fn eval_do(&mut self, args: &[Expr], env: Env, depth: usize) -> Result<Step> {
         if args.len() < 2 {
             return Err("do needs bindings and a termination clause".into());
         }
         let bindings = bindings(&args[0], BindingForm::Do)?;
-        let Value::List(termination) = args[1].datum() else {
+        let ExprKind::List(termination) = &args[1].kind else {
             return Err("do expects a termination clause".into());
         };
         if termination.is_empty() {
@@ -1004,28 +1261,28 @@ impl Interpreter {
         }
     }
 
-    fn eval_module(&mut self, args: &[Value], _env: Env, depth: usize) -> Result<Step> {
+    fn eval_module(&mut self, args: &[Expr], _env: Env, depth: usize) -> Result<Step> {
         if args.len() < 2 {
             return Err("module needs a name, (export name ...), and optional body".into());
         }
         let name = symbol(&args[0])?;
         if self.modules.contains_key(&name) {
-            return Err(format!("Module already defined: {name}"));
+            return Err(format!("Module already defined: {name}").into());
         }
-        let Value::List(exports) = args[1].datum() else {
+        let ExprKind::List(exports) = &args[1].kind else {
             return Err("module needs an (export name ...) declaration".into());
         };
         if !exports.first().is_some_and(|v| is_symbol(v, "export")) {
             return Err("module needs an (export name ...) declaration".into());
         }
-        let exports = parameters(&Value::List(exports[1..].to_vec()))?;
+        let exports = parameters(&Expr::list(exports[1..].to_vec()))?;
         let local = self.scope(Some(self.prelude.clone()));
         for expression in &args[2..] {
             self.eval(expression, local.clone(), depth + 1)?;
         }
         // A nested declaration may have claimed this name during body evaluation.
         if self.modules.contains_key(&name) {
-            return Err(format!("Module already defined: {name}"));
+            return Err(format!("Module already defined: {name}").into());
         }
         let mut values = HashMap::new();
         for export in exports {
@@ -1041,7 +1298,7 @@ impl Interpreter {
         Ok(Step::Value(Value::Symbol(name)))
     }
 
-    fn eval_import(&mut self, args: &[Value], env: Env) -> Result<Step> {
+    fn eval_import(&mut self, args: &[Expr], env: Env) -> Result<Step> {
         if args.len() < 2 {
             return Err("import needs a module name and explicit binding names".into());
         }
@@ -1050,11 +1307,11 @@ impl Interpreter {
             .modules
             .get(&name)
             .ok_or_else(|| format!("Unknown module: {name}. Load its source first."))?;
-        let names = parameters(&Value::List(args[1..].to_vec()))?;
+        let names = parameters(&Expr::list(args[1..].to_vec()))?;
         let mut values = Vec::new();
         for key in names {
             if env.borrow().values.contains_key(&key) {
-                return Err(format!("Import would overwrite binding: {key}"));
+                return Err(format!("Import would overwrite binding: {key}").into());
             }
             let value = exports
                 .get(&key)
@@ -1065,7 +1322,7 @@ impl Interpreter {
         Ok(Step::Value(Value::List(vec![])))
     }
 
-    fn eval(&mut self, expression: &Value, env: Env, depth: usize) -> Result<Value> {
+    fn eval(&mut self, expression: &Expr, env: Env, depth: usize) -> Result<Value> {
         self.finish(Step::Eval(expression.clone(), env), depth)
     }
 
@@ -1078,12 +1335,12 @@ impl Interpreter {
             let result = match step {
                 Step::Value(value) => return Ok(value),
                 Step::Eval(expression, env) => {
-                    if let Value::Syntax(_, location) = &expression {
-                        current_context = match expression.datum() {
-                            Value::List(items) => items
+                    if let Some(location) = &expression.location {
+                        current_context = match &expression.kind {
+                            ExprKind::List(items) => items
                                 .first()
-                                .and_then(|head| match head.datum() {
-                                    Value::Symbol(name) => Some(format!(" in {name}")),
+                                .and_then(|head| match &head.kind {
+                                    ExprKind::Symbol(name) => Some(format!(" in {name}")),
                                     _ => None,
                                 })
                                 .unwrap_or_default(),
@@ -1101,7 +1358,7 @@ impl Interpreter {
             };
             step = result.map_err(|mut error| {
                 if let Some(location) = &current {
-                    error = location.context(error, &current_context);
+                    error = error.at(location, &current_context);
                 }
                 if let Some(location) = &origin {
                     if current.as_ref().is_some_and(|last| {
@@ -1109,7 +1366,7 @@ impl Interpreter {
                             || last.line != location.line
                             || last.column != location.column
                     }) {
-                        error = location.context(error, &origin_context);
+                        error = error.at(location, &origin_context);
                     }
                 }
                 error
@@ -1117,31 +1374,35 @@ impl Interpreter {
         }
     }
 
-    fn eval_step(&mut self, expression: &Value, env: Env, depth: usize) -> Result<Step> {
+    fn eval_step(&mut self, expression: &Expr, env: Env, depth: usize) -> Result<Step> {
         self.tick(depth)?;
-        let items = match expression.datum() {
-            Value::Symbol(name) => return lookup(&env, name).map(Step::Value),
-            Value::List(items) if !items.is_empty() => items,
+        let items = match &expression.kind {
+            ExprKind::Symbol(name) => return lookup(&env, name).map(Step::Value),
+            ExprKind::List(items) if !items.is_empty() => items,
             _ => return Ok(Step::Value(expression.quoted())),
         };
         let args = &items[1..];
-        if let Value::Symbol(name) = items[0].datum() {
-            match name.as_str() {
+        if let ExprKind::Symbol(name) = &items[0].kind {
+            match if name.identity.is_none() {
+                name.as_str()
+            } else {
+                ""
+            } {
                 "quote" => {
-                    arity(name, args, 1)?;
+                    arity(name.as_str(), args, 1)?;
                     return Ok(Step::Value(args[0].quoted()));
                 }
                 "quasiquote" => {
-                    arity(name, args, 1)?;
+                    arity(name.as_str(), args, 1)?;
                     return self
                         .quasiquote(&args[0], 1, env, depth + 1)
                         .map(Step::Value);
                 }
                 "unquote" | "unquote-splicing" => {
-                    return Err(format!("{name} is only valid inside quasiquote"));
+                    return Err(format!("{name} is only valid inside quasiquote").into());
                 }
                 "set!" => {
-                    arity(name, args, 2)?;
+                    arity(name.as_str(), args, 2)?;
                     let key = symbol(&args[0])?;
                     let value = self.eval(&args[1], env.clone(), depth + 1)?;
                     assign(&env, &key, value)?;
@@ -1150,14 +1411,14 @@ impl Interpreter {
                 "module" => return self.eval_module(args, env, depth),
                 "import" => return self.eval_import(args, env),
                 "load" => {
-                    arity(name, args, 1)?;
+                    arity(name.as_str(), args, 1)?;
                     let Value::Text(path) = self.eval(&args[0], env.clone(), depth + 1)? else {
                         return Err("load expects a source filename string".into());
                     };
-                    let caller = match expression {
-                        Value::Syntax(_, location) => location.source.as_ref(),
-                        _ => "<input>",
-                    };
+                    let caller = expression
+                        .location
+                        .as_ref()
+                        .map_or("<input>", |location| location.source.as_ref());
                     let (name, source) = if let Some(source) = self.sources.get(&path) {
                         (path.clone(), source.clone())
                     } else if let Some(loader) = &mut self.loader {
@@ -1165,10 +1426,11 @@ impl Interpreter {
                     } else {
                         return Err(format!(
                             "Source not registered: {path}. Open the file before loading it."
-                        ));
+                        )
+                        .into());
                     };
                     if self.loading.len() >= 32 || self.loading.contains(&name) {
-                        return Err(format!("Cyclic or excessively nested load: {name}"));
+                        return Err(format!("Cyclic or excessively nested load: {name}").into());
                     }
                     let expressions = Self::read(&source, &name)?;
                     self.loading.push(name);
@@ -1187,11 +1449,11 @@ impl Interpreter {
                 "do" => return self.eval_do(args, env, depth),
                 "when" | "unless" => {
                     if args.is_empty() {
-                        return Err(format!("{name} needs a test"));
+                        return Err(format!("{name} needs a test").into());
                     }
                     let body = form("begin", args[1..].to_vec());
-                    let empty = Value::List(vec![]);
-                    let branches = if name == "when" {
+                    let empty = Expr::list(vec![]);
+                    let branches = if name.is("when") {
                         vec![body, empty]
                     } else {
                         vec![empty, body]
@@ -1201,7 +1463,7 @@ impl Interpreter {
                     return Ok(Step::Eval(form("if", conditional), env));
                 }
                 "if" => {
-                    arity(name, args, 3)?;
+                    arity(name.as_str(), args, 3)?;
                     let condition = self.eval(&args[0], env.clone(), depth + 1)?;
                     return Ok(Step::Eval(
                         args[if truthy(&condition) { 1 } else { 2 }].clone(),
@@ -1212,15 +1474,15 @@ impl Interpreter {
                     if args.len() < 2 {
                         return Err("define needs a name and a value or body".into());
                     }
-                    let (key, value) = match args[0].datum() {
-                        Value::Symbol(key) => {
-                            arity(name, args, 2)?;
+                    let (key, value) = match &args[0].kind {
+                        ExprKind::Symbol(key) => {
+                            arity(name.as_str(), args, 2)?;
                             (key.clone(), self.eval(&args[1], env.clone(), depth + 1)?)
                         }
-                        Value::List(signature) if !signature.is_empty() => (
+                        ExprKind::List(signature) if !signature.is_empty() => (
                             symbol(&signature[0])?,
                             procedure(
-                                parameters(&Value::List(signature[1..].to_vec()))?,
+                                parameters(&Expr::list(signature[1..].to_vec()))?,
                                 args[1..].to_vec(),
                                 env.clone(),
                             ),
@@ -1230,6 +1492,7 @@ impl Interpreter {
                     env.borrow_mut().values.insert(key.clone(), value);
                     return Ok(Step::Value(Value::Symbol(key)));
                 }
+                "defmacro" => return self.define_macro(args, env),
                 "lambda" => {
                     if args.len() < 2 {
                         return Err("lambda needs parameters and a body".into());
@@ -1246,11 +1509,11 @@ impl Interpreter {
                 "letrec" => return self.eval_let(BindingForm::Letrec, args, env, depth),
                 "and" | "or" => {
                     let Some((last, before)) = args.split_last() else {
-                        return Ok(Step::Value(Value::Bool(name == "and")));
+                        return Ok(Step::Value(Value::Bool(name.is("and"))));
                     };
                     for arg in before {
                         let result = self.eval(arg, env.clone(), depth + 1)?;
-                        if truthy(&result) == (name == "or") {
+                        if truthy(&result) == name.is("or") {
                             return Ok(Step::Value(result));
                         }
                     }
@@ -1260,11 +1523,71 @@ impl Interpreter {
             }
         }
         let function = self.eval(&items[0], env.clone(), depth + 1)?;
+        if let Value::Macro(transformer) = function {
+            return self.expand_macro(transformer, args, expression.location.as_ref(), env, depth);
+        }
         let values = args
             .iter()
             .map(|arg| self.eval(arg, env.clone(), depth + 1))
             .collect::<Result<Vec<_>>>()?;
         Ok(Step::Call(function, values))
+    }
+
+    fn define_macro(&mut self, args: &[Expr], env: Env) -> Result<Step> {
+        if args.len() < 3 {
+            return Err("defmacro needs a name, parameter list, and body".into());
+        }
+        let key = symbol(&args[0])?;
+        let mut params = parameters(&args[1])?;
+        let rest = if let Some(index) = params.iter().position(|name| name.is("&rest")) {
+            if index + 2 != params.len() {
+                return Err("defmacro &rest must precede one final parameter".into());
+            }
+            let rest = params.pop();
+            params.pop();
+            rest
+        } else {
+            None
+        };
+        let transformer = Procedure {
+            params,
+            rest,
+            body: args[2..].to_vec(),
+            env: env.clone(),
+        };
+        env.borrow_mut()
+            .values
+            .insert(key.clone(), Value::Macro(Rc::new(transformer)));
+        Ok(Step::Value(Value::Symbol(key)))
+    }
+
+    fn expand_macro(
+        &mut self,
+        transformer: Rc<Procedure>,
+        args: &[Expr],
+        location: Option<&Location>,
+        env: Env,
+        depth: usize,
+    ) -> Result<Step> {
+        if args.len() < transformer.params.len()
+            || (transformer.rest.is_none() && args.len() != transformer.params.len())
+        {
+            return Err(format!(
+                "Macro expects {}{} argument(s), got {}",
+                if transformer.rest.is_some() {
+                    "at least "
+                } else {
+                    ""
+                },
+                transformer.params.len(),
+                args.len()
+            )
+            .into());
+        }
+        let datums = args.iter().map(Expr::quoted).collect();
+        let expansion = self.call(Value::Function(transformer), datums, depth + 1)?;
+        let expanded = self.datum_expression(&expansion, location, depth + 1)?;
+        Ok(Step::Eval(expanded, env))
     }
 
     fn call(&mut self, function: Value, args: Vec<Value>, depth: usize) -> Result<Value> {
@@ -1273,16 +1596,25 @@ impl Interpreter {
 
     fn call_step(&mut self, function: Value, args: Vec<Value>, depth: usize) -> Result<Step> {
         self.tick(depth)?;
-        let name = match function {
+        let builtin = match function {
             Value::Function(function) => {
-                if function.params.len() != args.len() {
+                if args.len() < function.params.len()
+                    || (function.rest.is_none() && function.params.len() != args.len())
+                {
                     return Err(format!(
                         "Procedure expects {} arguments, got {}",
                         function.params.len(),
                         args.len()
-                    ));
+                    )
+                    .into());
                 }
                 let local = self.scope(Some(function.env.clone()));
+                if let Some(rest) = &function.rest {
+                    local.borrow_mut().values.insert(
+                        rest.clone(),
+                        Value::List(args[function.params.len()..].to_vec()),
+                    );
+                }
                 local
                     .borrow_mut()
                     .values
@@ -1292,202 +1624,265 @@ impl Interpreter {
             Value::Builtin(name) => name,
             _ => return Err("First item in a call must be a procedure".into()),
         };
-        if name == "apply" {
-            arity(&name, &args, 2)?;
-            let Value::List(list) = &args[1] else {
-                return Err("apply expects a list".into());
-            };
-            return Ok(Step::Call(args[0].clone(), list.clone()));
-        }
-        self.builtin(&name, args, depth).map(Step::Value)
+        builtin.call(self, args, depth)
     }
 
-    fn builtin(&mut self, name: &str, args: Vec<Value>, depth: usize) -> Result<Value> {
-        let n = name;
-        match n {
-            "+" | "-" | "*" | "/" | "=" | "<" | ">" | "<=" | ">=" | "modulo" | "abs" => {
-                let nums = args
-                    .iter()
-                    .map(|v| {
-                        if let Value::Number(n) = v {
-                            Ok(*n)
-                        } else {
-                            Err(format!("{name} expects numbers"))
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if n == "abs" {
-                    arity(n, &args, 1)?;
-                    return Ok(Value::Number(nums[0].abs()));
-                }
-                if n == "modulo" {
-                    arity(n, &args, 2)?;
-                    if nums[1] == 0.0 {
-                        return Err("Division by zero".into());
-                    }
-                    return Ok(Value::Number(((nums[0] % nums[1]) + nums[1]) % nums[1]));
-                }
-                if ["=", "<", ">", "<=", ">="].contains(&n) {
-                    if nums.len() < 2 {
-                        return Err(format!("{n} needs at least two numbers"));
-                    }
-                    return Ok(Value::Bool(nums.windows(2).all(|p| match n {
-                        "=" => p[0] == p[1],
-                        "<" => p[0] < p[1],
-                        ">" => p[0] > p[1],
-                        "<=" => p[0] <= p[1],
-                        _ => p[0] >= p[1],
-                    })));
-                }
-                if nums.is_empty() && (n == "-" || n == "/") {
-                    return Err(format!("{n} needs at least one number"));
-                }
-                let result = match n {
-                    "+" => nums.iter().fold(0.0, |a, b| a + b),
-                    "*" => nums.iter().product(),
-                    "-" if nums.len() == 1 => -nums[0],
-                    "-" => nums[1..].iter().fold(nums[0], |a, b| a - b),
-                    "/" => {
-                        let (start, divisors): (f64, &[f64]) = if nums.len() == 1 {
-                            (1.0, &nums)
-                        } else {
-                            (nums[0], &nums[1..])
-                        };
-                        if divisors.contains(&0.0) {
-                            return Err("Division by zero".into());
-                        }
-                        divisors.iter().fold(start, |a, b| a / b)
-                    }
-                    _ => unreachable!(),
-                };
-                if !result.is_finite() {
-                    return Err("Numeric result is not finite".into());
-                }
-                Ok(Value::Number(result))
+    fn numeric(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        let name = builtin.name();
+        let nums = args
+            .iter()
+            .map(|value| match value {
+                Value::Number(number) => Ok(*number),
+                _ => Err(Diagnostic::from(format!("{name} expects numbers"))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        builtin.arguments().check(name, &args)?;
+        let number = match builtin {
+            NumericEqual | Less | Greater | LessEqual | GreaterEqual => {
+                return Ok(Step::Value(Value::Bool(nums.windows(2).all(
+                    |pair| match builtin {
+                        NumericEqual => pair[0] == pair[1],
+                        Less => pair[0] < pair[1],
+                        Greater => pair[0] > pair[1],
+                        LessEqual => pair[0] <= pair[1],
+                        GreaterEqual => pair[0] >= pair[1],
+                        _ => unreachable!(),
+                    },
+                ))));
             }
-            "symbols" => {
-                arity(n, &args, 0)?;
-                let mut names: Vec<_> = self.env.borrow().values.keys().cloned().collect();
-                if names.len() > limits::LIST_ITEMS {
-                    return Err("List size limit reached".into());
+            Abs => nums[0].abs(),
+            Modulo => {
+                if nums[1] == 0.0 {
+                    return Err("Division by zero".into());
                 }
-                names.sort();
-                Ok(Value::List(names.into_iter().map(Value::Symbol).collect()))
+                return Ok(Step::Value(Value::Number(
+                    ((nums[0] % nums[1]) + nums[1]) % nums[1],
+                )));
             }
-            "list" => {
-                if args.len() > limits::LIST_ITEMS {
-                    return Err("List size limit reached".into());
-                }
-                Ok(Value::List(args))
-            }
-            "equal?" | "eq?" => {
-                arity(n, &args, 2)?;
-                // Lists and strings are immutable values; both predicates compare them by value.
-                let equal = datum_equal(&args[0], &args[1]);
-                Ok(Value::Bool(equal))
-            }
-            "not" | "null?" | "number?" | "list?" | "boolean?" | "string?" | "symbol?"
-            | "procedure?" => {
-                arity(n, &args, 1)?;
-                Ok(Value::Bool(match n {
-                    "not" => !truthy(&args[0]),
-                    "null?" => matches!(&args[0], Value::List(l) if l.is_empty()),
-                    "number?" => matches!(args[0], Value::Number(_)),
-                    "list?" => matches!(args[0], Value::List(_)),
-                    "boolean?" => matches!(args[0], Value::Bool(_)),
-                    "string?" => matches!(args[0], Value::Text(_)),
-                    "symbol?" => matches!(args[0], Value::Symbol(_)),
-                    _ => matches!(args[0], Value::Function(..) | Value::Builtin(_)),
-                }))
-            }
-            "string-length" | "string-append" | "substring" | "string-ref" | "string=?"
-            | "string->symbol" | "symbol->string" | "number->string" | "string->number" => {
-                self.string_builtin(n, &args)
-            }
-            "error" => {
-                if args.is_empty() {
-                    return Err("error needs a message string and optional values".into());
-                }
-                let Value::Text(message) = &args[0] else {
-                    return Err("error expects a message string".into());
-                };
-                let details = args[1..]
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Err(if details.is_empty() {
-                    message.clone()
+            Add => nums.iter().fold(0.0, |a, b| a + b),
+            Multiply => nums.iter().product(),
+            Subtract if nums.len() == 1 => -nums[0],
+            Subtract => nums[1..].iter().fold(nums[0], |a, b| a - b),
+            Divide => {
+                let (start, divisors): (f64, &[f64]) = if nums.len() == 1 {
+                    (1.0, &nums)
                 } else {
-                    format!("{message}: {details}")
-                })
-            }
-            "car" | "cdr" | "length" => {
-                arity(n, &args, 1)?;
-                let Value::List(list) = &args[0] else {
-                    return Err(format!("{n} expects a list"));
+                    (nums[0], &nums[1..])
                 };
-                match n {
-                    "length" => Ok(Value::Number(list.len() as f64)),
-                    _ if list.is_empty() => Err(format!("{n} needs a nonempty list")),
-                    "car" => Ok(list[0].clone()),
-                    _ => Ok(Value::List(list[1..].to_vec())),
+                if divisors.contains(&0.0) {
+                    return Err("Division by zero".into());
                 }
+                divisors.iter().fold(start, |a, b| a / b)
             }
-            "cons" | "append" => {
-                arity(n, &args, 2)?;
-                let Value::List(tail) = &args[1] else {
-                    return Err(format!("{n} expects a list as its second argument"));
-                };
-                let mut result = if n == "cons" {
-                    vec![args[0].clone()]
-                } else if let Value::List(head) = &args[0] {
-                    head.clone()
-                } else {
-                    return Err("append expects lists".into());
-                };
-                result.extend(tail.clone());
-                if result.len() > limits::LIST_ITEMS {
-                    return Err("List size limit reached".into());
-                }
-                Ok(Value::List(result))
-            }
-            "display" => {
-                arity(n, &args, 1)?;
-                let text = if let Value::Text(s) = &args[0] {
-                    s.clone()
-                } else {
-                    args[0].to_string()
-                };
-                self.write_output(&text)?;
-                Ok(Value::List(vec![]))
-            }
-            "newline" => {
-                arity(n, &args, 0)?;
-                self.write_output("\n")?;
-                Ok(Value::List(vec![]))
-            }
-            "map" | "filter" => {
-                arity(n, &args, 2)?;
-                let Value::List(list) = &args[1] else {
-                    return Err(format!("{n} expects a list"));
-                };
-                let mut result = Vec::new();
-                for item in list {
-                    let value = self.call(args[0].clone(), vec![item.clone()], depth + 1)?;
-                    if n == "map" {
-                        result.push(value);
-                    } else if truthy(&value) {
-                        result.push(item.clone());
-                    }
-                }
-                Ok(Value::List(result))
-            }
-            _ => Err(format!("Unknown builtin: {n}")),
+            _ => unreachable!(),
+        };
+        if !number.is_finite() {
+            return Err("Numeric result is not finite".into());
         }
+        Ok(Step::Value(Value::Number(number)))
     }
 
-    fn string_builtin(&mut self, name: &str, args: &[Value]) -> Result<Value> {
+    fn symbols(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let mut names: Vec<_> = self.env.borrow().values.keys().cloned().collect();
+        if names.len() > limits::LIST_ITEMS {
+            return Err("List size limit reached".into());
+        }
+        names.sort();
+        Ok(Step::Value(Value::List(
+            names.into_iter().map(Value::Symbol).collect(),
+        )))
+    }
+
+    fn datum_expression(
+        &mut self,
+        value: &Value,
+        location: Option<&Location>,
+        depth: usize,
+    ) -> Result<Expr> {
+        self.tick(depth)?;
+        let kind = match value {
+            Value::Number(number) => ExprKind::Number(*number),
+            Value::Bool(boolean) => ExprKind::Bool(*boolean),
+            Value::Text(text) => ExprKind::Text(text.clone()),
+            Value::Symbol(symbol) => ExprKind::Symbol(symbol.clone()),
+            Value::List(items) => {
+                if items.len() > limits::LIST_ITEMS {
+                    return Err("List size limit reached".into());
+                }
+                ExprKind::List(
+                    items
+                        .iter()
+                        .map(|item| self.datum_expression(item, location, depth + 1))
+                        .collect::<Result<_>>()?,
+                )
+            }
+            _ => return Err(
+                "Executable data must contain only numbers, booleans, strings, symbols, and lists"
+                    .into(),
+            ),
+        };
+        Ok(Expr {
+            kind,
+            location: location.cloned(),
+        })
+    }
+
+    fn eval_datum(&mut self, builtin: Builtin, args: Vec<Value>, depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let location = Location {
+            source: "<eval>".into(),
+            line: 1,
+            column: 1,
+        };
+        let expression = self.datum_expression(&args[0], Some(&location), depth + 1)?;
+        Ok(Step::Eval(expression, self.env.clone()))
+    }
+
+    fn gensym(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let identity = NEXT
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Diagnostic::from("Generated symbol identity limit reached"))?;
+        Ok(Step::Value(Value::Symbol(Symbol(Rc::new(SymbolName {
+            name: format!("g{identity}"),
+            identity: Some(identity),
+        })))))
+    }
+
+    fn make_list(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        if args.len() > limits::LIST_ITEMS {
+            return Err("List size limit reached".into());
+        }
+        Ok(Step::Value(Value::List(args)))
+    }
+
+    fn equality(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        Ok(Step::Value(Value::Bool(datum_equal(&args[0], &args[1]))))
+    }
+
+    fn predicate(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let result = match builtin {
+            Not => !truthy(&args[0]),
+            Null => matches!(&args[0], Value::List(items) if items.is_empty()),
+            IsNumber => matches!(args[0], Value::Number(_)),
+            IsList => matches!(args[0], Value::List(_)),
+            IsBoolean => matches!(args[0], Value::Bool(_)),
+            IsString => matches!(args[0], Value::Text(_)),
+            IsSymbol => matches!(args[0], Value::Symbol(_)),
+            IsProcedure => matches!(args[0], Value::Function(_) | Value::Builtin(_)),
+            _ => unreachable!(),
+        };
+        Ok(Step::Value(Value::Bool(result)))
+    }
+
+    fn raise_error(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let Value::Text(message) = &args[0] else {
+            return Err("error expects a message string".into());
+        };
+        let details = args[1..]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Err(if details.is_empty() {
+            message.clone()
+        } else {
+            format!("{message}: {details}")
+        }
+        .into())
+    }
+
+    fn list_access(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        let name = builtin.name();
+        builtin.arguments().check(name, &args)?;
+        let Value::List(list) = &args[0] else {
+            return Err(format!("{name} expects a list").into());
+        };
+        let value = match builtin {
+            Length => Value::Number(list.len() as f64),
+            _ if list.is_empty() => return Err(format!("{name} needs a nonempty list").into()),
+            Car => list[0].clone(),
+            Cdr => Value::List(list[1..].to_vec()),
+            _ => unreachable!(),
+        };
+        Ok(Step::Value(value))
+    }
+
+    fn combine_lists(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        let name = builtin.name();
+        builtin.arguments().check(name, &args)?;
+        let Value::List(tail) = &args[1] else {
+            return Err(format!("{name} expects a list as its second argument").into());
+        };
+        let mut result = if builtin == Cons {
+            vec![args[0].clone()]
+        } else if let Value::List(head) = &args[0] {
+            head.clone()
+        } else {
+            return Err("append expects lists".into());
+        };
+        result.extend(tail.clone());
+        if result.len() > limits::LIST_ITEMS {
+            return Err("List size limit reached".into());
+        }
+        Ok(Step::Value(Value::List(result)))
+    }
+
+    fn display(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let text = if let Value::Text(text) = &args[0] {
+            text.clone()
+        } else {
+            args[0].to_string()
+        };
+        self.write_output(&text)?;
+        Ok(Step::Value(Value::List(vec![])))
+    }
+
+    fn newline(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        self.write_output("\n")?;
+        Ok(Step::Value(Value::List(vec![])))
+    }
+
+    fn transform_list(&mut self, builtin: Builtin, args: Vec<Value>, depth: usize) -> Result<Step> {
+        let name = builtin.name();
+        builtin.arguments().check(name, &args)?;
+        let Value::List(list) = &args[1] else {
+            return Err(format!("{name} expects a list").into());
+        };
+        let mut result = Vec::new();
+        for item in list {
+            let value = self.call(args[0].clone(), vec![item.clone()], depth + 1)?;
+            if builtin == Map {
+                result.push(value);
+            } else if truthy(&value) {
+                result.push(item.clone());
+            }
+        }
+        Ok(Step::Value(Value::List(result)))
+    }
+
+    fn apply(&mut self, builtin: Builtin, args: Vec<Value>, _depth: usize) -> Result<Step> {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let Value::List(list) = &args[1] else {
+            return Err("apply expects a list".into());
+        };
+        Ok(Step::Call(args[0].clone(), list.clone()))
+    }
+
+    fn string_builtin(
+        &mut self,
+        builtin: Builtin,
+        args: Vec<Value>,
+        _depth: usize,
+    ) -> Result<Step> {
         fn text(value: &Value) -> Result<&str> {
             if let Value::Text(text) = value {
                 Ok(text)
@@ -1508,32 +1903,27 @@ impl Interpreter {
                 _ => Err("String index must be a nonnegative integer within the string".into()),
             }
         }
-        match name {
-            "string-append" => {
+        builtin.arguments().check(builtin.name(), &args)?;
+        let value = match builtin {
+            StringAppend => {
                 let mut result = String::new();
-                for arg in args {
+                for arg in &args {
                     let part = text(arg)?;
                     if result.len() + part.len() > limits::OUTPUT_BYTES {
                         return Err("String size limit reached (128 KiB)".into());
                     }
                     result.push_str(part);
                 }
-                Ok(Value::Text(result))
+                Value::Text(result)
             }
-            "string=?" => {
-                if args.len() < 2 {
-                    return Err("string=? needs at least two strings".into());
-                }
+            StringEqual => {
                 let strings = args.iter().map(text).collect::<Result<Vec<_>>>()?;
-                Ok(Value::Bool(
-                    strings.windows(2).all(|pair| pair[0] == pair[1]),
-                ))
+                Value::Bool(strings.windows(2).all(|pair| pair[0] == pair[1]))
             }
-            "substring" | "string-ref" => {
-                arity(name, args, if name == "substring" { 3 } else { 2 })?;
+            Substring | StringRef => {
                 let chars: Vec<_> = text(&args[0])?.chars().collect();
                 let start = index(&args[1])?;
-                let end = if name == "substring" {
+                let end = if builtin == Substring {
                     index(&args[2])?
                 } else {
                     start + 1
@@ -1541,40 +1931,39 @@ impl Interpreter {
                 if start > end || end > chars.len() {
                     return Err("String index out of bounds".into());
                 }
-                Ok(Value::Text(chars[start..end].iter().collect()))
+                Value::Text(chars[start..end].iter().collect())
             }
-            _ => {
-                arity(name, args, 1)?;
-                match name {
-                    "string-length" => Ok(Value::Number(text(&args[0])?.chars().count() as f64)),
-                    "string->symbol" => {
-                        let name = text(&args[0])?;
-                        let parsed = Self::read(name, "<symbol>")?;
-                        if parsed.len() != 1
-                            || !matches!(parsed[0].datum(), Value::Symbol(symbol) if symbol == name)
-                        {
-                            return Err("string->symbol expects one readable symbol name".into());
-                        }
-                        Ok(Value::Symbol(name.into()))
-                    }
-                    "symbol->string" => Ok(Value::Text(symbol(&args[0])?)),
-                    "number->string" => match &args[0] {
-                        Value::Number(number) => Ok(Value::Text(number.to_string())),
-                        _ => Err("number->string expects a number".into()),
-                    },
-                    "string->number" => {
-                        let number = text(&args[0])?
-                            .parse::<f64>()
-                            .map_err(|_| "string->number expects a valid number".to_string())?;
-                        if !number.is_finite() {
-                            return Err("Numeric result is not finite".into());
-                        }
-                        Ok(Value::Number(number))
-                    }
-                    _ => unreachable!(),
+            StringLength => Value::Number(text(&args[0])?.chars().count() as f64),
+            StringToSymbol => {
+                let name = text(&args[0])?;
+                let parsed = Self::read(name, "<symbol>")?;
+                if parsed.len() != 1
+                    || !matches!(&parsed[0].kind, ExprKind::Symbol(symbol) if symbol.is(name))
+                {
+                    return Err("string->symbol expects one readable symbol name".into());
                 }
+                Value::Symbol(name.into())
             }
-        }
+            SymbolToString => match &args[0] {
+                Value::Symbol(name) => Value::Text(name.name.clone()),
+                _ => return Err("Expected a symbol".into()),
+            },
+            NumberToString => match &args[0] {
+                Value::Number(number) => Value::Text(number.to_string()),
+                _ => return Err("number->string expects a number".into()),
+            },
+            StringToNumber => {
+                let number = text(&args[0])?
+                    .parse::<f64>()
+                    .map_err(|_| Diagnostic::from("string->number expects a valid number"))?;
+                if !number.is_finite() {
+                    return Err("Numeric result is not finite".into());
+                }
+                Value::Number(number)
+            }
+            _ => unreachable!(),
+        };
+        Ok(Step::Value(value))
     }
 }
 
@@ -1635,7 +2024,10 @@ fn serialize_evaluations(result: Result<Vec<Evaluation>>) -> String {
                 .collect();
             format!("{{\"evaluations\":[{}],\"error\":null}}", entries.join(","))
         }
-        Err(error) => format!("{{\"evaluations\":[],\"error\":{}}}", json_string(&error)),
+        Err(error) => format!(
+            "{{\"evaluations\":[],\"error\":{}}}",
+            json_string(&error.to_string())
+        ),
     }
 }
 
@@ -1663,14 +2055,7 @@ pub extern "C" fn input_buffer(len: usize) -> *mut u8 {
 
 #[no_mangle]
 pub extern "C" fn evaluate() -> i32 {
-    let result = INPUT.with(|input| match std::str::from_utf8(&input.borrow()) {
-        Ok(source) => RUNTIME.with(|runtime| runtime.borrow_mut().execute(source)),
-        Err(_) => Err("Input must be UTF-8".into()),
-    });
-    let failed = result.is_err();
-    let text = serialize_evaluations(result);
-    OUTPUT.with(|output| *output.borrow_mut() = text.into_bytes());
-    i32::from(failed)
+    request(RequestOperation::Evaluate)
 }
 
 #[no_mangle]
@@ -1685,27 +2070,42 @@ pub extern "C" fn source_name_buffer(len: usize) -> *mut u8 {
     })
 }
 
-fn named_request(register: bool) -> i32 {
+#[derive(Clone, Copy)]
+enum RequestOperation {
+    Evaluate,
+    EvaluateNamed,
+    RegisterSource,
+}
+
+fn decode_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|_| format!("{label} must be UTF-8").into())
+}
+
+fn request(operation: RequestOperation) -> i32 {
     let result = SOURCE_NAME.with(|name| {
         INPUT.with(|input| {
             let name = name.borrow();
-            let name = std::str::from_utf8(&name)
-                .map_err(|_| "Source filename must be UTF-8".to_string())?;
+            let name = match operation {
+                RequestOperation::Evaluate => "<input>",
+                _ => decode_utf8(&name, "Source filename")?,
+            };
             if name.is_empty() || name.chars().any(char::is_control) {
                 return Err(
                     "Source filename must not be empty or contain control characters".into(),
                 );
             }
             let input = input.borrow();
-            let source =
-                std::str::from_utf8(&input).map_err(|_| "Input must be UTF-8".to_string())?;
+            let source = decode_utf8(&input, "Input")?;
             RUNTIME.with(|runtime| {
                 let mut runtime = runtime.borrow_mut();
-                if register {
-                    runtime.register_source(name, source)?;
-                    Ok(vec![])
-                } else {
-                    runtime.execute_named(source, name)
+                match operation {
+                    RequestOperation::RegisterSource => {
+                        runtime.register_source(name, source)?;
+                        Ok(vec![])
+                    }
+                    RequestOperation::Evaluate | RequestOperation::EvaluateNamed => {
+                        runtime.execute_named(source, name)
+                    }
                 }
             })
         })
@@ -1717,12 +2117,37 @@ fn named_request(register: bool) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn evaluate_named() -> i32 {
-    named_request(false)
+    request(RequestOperation::EvaluateNamed)
 }
 
 #[no_mangle]
 pub extern "C" fn register_source() -> i32 {
-    named_request(true)
+    request(RequestOperation::RegisterSource)
+}
+
+#[no_mangle]
+pub extern "C" fn completion_symbols() {
+    let json = RUNTIME.with(|runtime| {
+        let runtime = runtime.borrow();
+        let mut names: Vec<_> = runtime
+            .env
+            .borrow()
+            .values
+            .keys()
+            .filter(|symbol| symbol.identity.is_none())
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        names.sort();
+        format!(
+            "[{}]",
+            names
+                .iter()
+                .map(|name| json_string(name))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    });
+    OUTPUT.with(|output| *output.borrow_mut() = json.into_bytes());
 }
 
 #[no_mangle]
@@ -1740,10 +2165,8 @@ mod tests {
 
     impl Interpreter {
         // Legacy presentation assertions remain fixtures; formatting is no longer part of execution.
-        fn run(&mut self, source: &str) -> Result<String> {
-            let evaluations = self
-                .execute(source)
-                .map_err(|error| error.lines().next().unwrap_or("").to_string())?;
+        fn run(&mut self, source: &str) -> std::result::Result<String, String> {
+            let evaluations = self.execute(source).map_err(|error| error.message)?;
             let text: String = evaluations
                 .iter()
                 .map(|evaluation| format!("{}{}\n", evaluation.output, evaluation.value))
@@ -1754,6 +2177,130 @@ mod tests {
 
     fn run(source: &str) -> String {
         Interpreter::new().run(source).unwrap()
+    }
+
+    #[test]
+    fn diagnostics_expose_fields_without_parsing_display_text() {
+        let mut runtime = Interpreter::new();
+        let error = runtime.execute_named("\n (", "broken.loop").err().unwrap();
+        assert_eq!(error.kind, ErrorKind::IncompleteInput);
+        assert_eq!(error.message, "Unclosed list: add a closing parenthesis");
+        assert_eq!(error.trace.len(), 1);
+        assert_eq!(error.trace[0].location.source.as_ref(), "broken.loop");
+        assert_eq!(error.trace[0].location.line, 2);
+        assert_eq!(error.trace[0].location.column, 2);
+        assert_eq!(
+            error.to_string(),
+            "Unclosed list: add a closing parenthesis\n  at broken.loop:2:2"
+        );
+
+        for source in ["(", "'", "`", ",", ",@", "\"text", "\"text\\"] {
+            let error = Interpreter::read(source, "incomplete.loop").err().unwrap();
+            assert_eq!(error.kind, ErrorKind::IncompleteInput, "{source}");
+            assert!(Interpreter::is_incomplete(source), "{source}");
+        }
+        for source in [")", "\"\\q\"", "(if #t 1 2)"] {
+            assert!(!Interpreter::is_incomplete(source), "{source}");
+        }
+        let error = runtime.execute("(error \"Unclosed list\")").err().unwrap();
+        assert_eq!(error.kind, ErrorKind::Runtime);
+        assert_eq!(error.message, "Unclosed list");
+        assert_eq!(error.trace[0].context, " in error");
+
+        let fake_trace = format!("problem{}", "\n  at fake:1:1".repeat(20));
+        let source = format!("(error \"{}\")", fake_trace.replace('\n', "\\n"));
+        let error = runtime.execute(&source).err().unwrap();
+        assert_eq!(error.message, fake_trace);
+        assert_eq!(
+            error.trace.len(),
+            1,
+            "message text must not affect trace accounting"
+        );
+        let error = runtime
+            .execute("(define (f n) (+ 1 (f (+ n 1)))) (f 0)")
+            .err()
+            .unwrap();
+        assert_eq!(error.trace.len(), 12);
+        assert!(error.message.starts_with("Call depth limit"));
+        assert_eq!(error.kind, ErrorKind::Runtime);
+    }
+
+    #[test]
+    fn expression_locations_are_not_runtime_data() {
+        let expressions = Interpreter::read("\n '(a (1 \"λ\" #t) ())", "data.loop").unwrap();
+        assert_eq!(expressions[0].location.as_ref().unwrap().line, 2);
+        let ExprKind::List(quote) = &expressions[0].kind else {
+            panic!("expected quote expression");
+        };
+        assert!(
+            quote[0].location.is_none(),
+            "reader shorthand introduces generated syntax"
+        );
+        let location = quote[1].location.as_ref().unwrap();
+        assert_eq!((location.line, location.column), (2, 3));
+        let datum = quote[1].quoted();
+        assert_eq!(datum.to_string(), "(a (1 \"λ\" #t) ())");
+        assert!(datum_equal(
+            &datum,
+            &Interpreter::new().execute("'(a (1 \"λ\" #t) ())").unwrap()[0].value
+        ));
+        assert_eq!(
+            run("(case '(a (1 \"λ\" #t) ())
+            (((a (1 \"λ\" #t) ())) 'yes) (else 'no))"),
+            "yes"
+        );
+        assert_eq!(
+            run("(list + (apply + '(1 2)) (eq? + +))"),
+            "(#<builtin:+> 3 #t)"
+        );
+    }
+
+    #[test]
+    fn builtin_registry_covers_names_dispatch_and_argument_rules() {
+        let mut runtime = Interpreter::new();
+        let mut names = HashSet::new();
+        for &builtin in Builtin::ALL {
+            let name = builtin.name();
+            assert!(names.insert(name), "duplicate builtin name: {name}");
+            assert!(
+                matches!(lookup(&runtime.env, &name.into()).unwrap(), Value::Builtin(value) if value == builtin)
+            );
+            let wrong_count = match builtin.arguments() {
+                Arguments::Exact(count) => count + 1,
+                Arguments::AtLeast(count, _) => count - 1,
+                Arguments::Any => continue,
+            };
+            let args = vec![Value::Number(1.0); wrong_count];
+            let expected = builtin.arguments().check(name, &args).err().unwrap();
+            let actual = builtin.call(&mut runtime, args, 0).err().unwrap();
+            assert_eq!(actual.message, expected.message, "{name}");
+        }
+        assert_eq!(
+            runtime
+                .env
+                .borrow()
+                .values
+                .values()
+                .filter(|value| matches!(value, Value::Builtin(_)))
+                .count(),
+            Builtin::ALL.len()
+        );
+        assert_eq!(
+            run("(abs -4) (modulo 7 3) (+) (*) (- 4) (/ 4)
+            (= 1 1 1) (< 1 2 3) (> 3 2 1) (<= 1 1) (>= 2 2)"),
+            "4\n1\n0\n1\n-4\n0.25\n#t\n#t\n#t\n#t\n#t"
+        );
+        for source in ["(abs #t 2)", "(modulo #t)", "(= #f)", "(- #t)"] {
+            assert!(
+                runtime
+                    .execute(source)
+                    .err()
+                    .unwrap()
+                    .message
+                    .ends_with("expects numbers"),
+                "preserve numeric validation order: {source}"
+            );
+        }
     }
 
     #[test]
@@ -1809,32 +2356,28 @@ mod tests {
             runtime
                 .execute(&" ".repeat(limits::INPUT_BYTES + 1))
                 .err()
-                .unwrap(),
+                .unwrap()
+                .to_string(),
             "Program exceeds the 64 KiB input limit"
         );
         assert!(runtime
             .execute(&"é".repeat(limits::INPUT_BYTES / 2 + 1))
             .err()
             .unwrap()
+            .to_string()
             .contains("input limit"));
         let mut value = Value::Number(1.0);
         for _ in 0..=limits::DEPTH {
             value = Value::List(vec![value]);
         }
         assert_eq!(
-            runtime
-                .execute(&value.to_string())
-                .err()
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
+            runtime.execute(&value.to_string()).err().unwrap().message,
             "Reader nesting limit reached"
         );
         let list = Value::List(vec![Value::Number(1.0); limits::LIST_ITEMS]);
         assert!(runtime
             .call(
-                Value::Builtin("list".into()),
+                Value::Builtin(List),
                 if let Value::List(items) = list.clone() {
                     items
                 } else {
@@ -1845,13 +2388,10 @@ mod tests {
             .is_ok());
         assert_eq!(
             runtime
-                .call(
-                    Value::Builtin("cons".into()),
-                    vec![Value::Number(0.0), list],
-                    0
-                )
+                .call(Value::Builtin(Cons), vec![Value::Number(0.0), list], 0)
                 .err()
-                .unwrap(),
+                .unwrap()
+                .to_string(),
             "List size limit reached"
         );
 
@@ -1860,15 +2400,14 @@ mod tests {
         runtime
             .write_output(&"x".repeat(limits::OUTPUT_BYTES - 1))
             .unwrap();
-        runtime
-            .call(Value::Builtin("newline".into()), vec![], 0)
-            .unwrap();
+        runtime.call(Value::Builtin(Newline), vec![], 0).unwrap();
         assert_eq!(runtime.output_bytes, limits::OUTPUT_BYTES);
         assert_eq!(
             runtime
-                .call(Value::Builtin("newline".into()), vec![], 0)
+                .call(Value::Builtin(Newline), vec![], 0)
                 .err()
-                .unwrap(),
+                .unwrap()
+                .to_string(),
             "Output limit reached"
         );
         assert!(runtime.execute("1").is_ok());
@@ -1892,9 +2431,7 @@ mod tests {
                 .execute("(begin (display chunk) (display chunk) 1)")
                 .err()
                 .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
+                .message,
             "Output limit reached"
         );
         assert_eq!(
@@ -1902,9 +2439,7 @@ mod tests {
                 .execute("(display chunk) (display chunk)")
                 .err()
                 .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
+                .message,
             "Output limit reached"
         );
         assert!(runtime.execute("2").is_ok());
@@ -1914,13 +2449,7 @@ mod tests {
     fn generated_nesting_is_bounded_before_building_large_trees() {
         let source = format!("(let* ({}) 1)", vec!["(x 1)"; limits::DEPTH + 1].join(" "));
         assert_eq!(
-            Interpreter::new()
-                .execute(&source)
-                .err()
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
+            Interpreter::new().execute(&source).err().unwrap().message,
             "Call depth limit reached. Try a smaller input."
         );
     }
@@ -2227,7 +2756,13 @@ mod tests {
     fn symbols_lists_sorted_global_bindings() {
         let mut runtime = Interpreter::new();
         runtime.run("(define zebra 1) (define apple 2)").unwrap();
-        let mut expected: Vec<_> = runtime.env.borrow().values.keys().cloned().collect();
+        let mut expected: Vec<_> = runtime
+            .env
+            .borrow()
+            .values
+            .keys()
+            .map(ToString::to_string)
+            .collect();
         expected.sort();
         let result = runtime.run("(symbols)").unwrap();
         assert_eq!(result, format!("({})", expected.join(" ")));
@@ -2299,7 +2834,8 @@ mod tests {
         let error = Interpreter::new()
             .execute("(define (grow n) (+ 1 (grow (+ n 1)))) (grow 0)")
             .err()
-            .unwrap();
+            .unwrap()
+            .to_string();
         assert!(error.starts_with("Call depth limit"), "{error}");
         assert!(error.lines().count() <= 14, "{error}");
     }
@@ -2307,11 +2843,12 @@ mod tests {
     #[test]
     fn tracing_collection_reclaims_cycles_and_preserves_live_closures() {
         let mut runtime = Interpreter::new();
+        let baseline = runtime.scopes.len();
         for _ in 0..100 {
             runtime
                 .execute("(letrec ((f (lambda () f))) 'done)")
                 .unwrap();
-            assert_eq!(runtime.scopes.len(), 2);
+            assert_eq!(runtime.scopes.len(), baseline);
         }
         runtime
             .execute(
@@ -2329,11 +2866,262 @@ mod tests {
             .is_err());
         assert_eq!(runtime.scopes.len(), live);
         runtime.execute("(set! saved #f)").unwrap();
-        assert_eq!(runtime.scopes.len(), 2);
+        assert_eq!(runtime.scopes.len(), baseline);
         runtime.execute("(define (recursive) recursive)").unwrap();
         let scopes = runtime.scopes.clone();
         drop(runtime);
         assert!(scopes.iter().all(|env| env.upgrade().is_none()));
+    }
+
+    #[test]
+    fn macros_use_raw_arguments_lexical_transformers_and_caller_scope() {
+        assert_eq!(
+            run("
+            (defmacro discard (x) 7)
+            (discard missing)
+            (defmacro twice (x) `(+ ,x ,x))
+            (let ((n 6)) (twice n))
+            (defmacro collect (&rest body) `(list ,@body))
+            (collect)
+            (collect 1 (+ 1 1) 'three)
+            (let ((offset 10))
+              (defmacro add-offset (x) `(+ ,x ,offset))
+              (let ((offset 99) (value 2)) (add-offset value)))
+            (list (procedure? twice) twice)
+            (define alias twice)
+            (alias 4)"),
+            "discard\n7\ntwice\n12\ncollect\n()\n(1 2 three)\n12\n(#f #<macro>)\nalias\n8"
+        );
+        assert_eq!(
+            run("
+            (defmacro once (expression &rest body)
+              (let ((temporary (gensym)))
+                `(let ((,temporary ,expression)) ,@body ,temporary)))
+            (define count 0)
+            (let ((g0 99)) (once (begin (set! count (+ count 1)) count) g0))
+            count
+            (module macros (export module-twice) (defmacro module-twice (x) `(+ ,x ,x)))
+            (import macros module-twice)
+            (module-twice 9)"),
+            "once\ncount\n1\n1\nmacros\n()\n18"
+        );
+        let mut runtime = Interpreter::new();
+        runtime
+            .execute_named("(defmacro bad (x) `(/ ,x 0))", "macros.loop")
+            .unwrap();
+        let error = runtime
+            .execute_named("\n(bad 2)", "caller.loop")
+            .err()
+            .unwrap();
+        assert_eq!(error.message, "Division by zero");
+        assert!(error.to_string().contains("caller.loop:2:1"), "{error}");
+        for source in [
+            "(defmacro)",
+            "(defmacro 1 () 2)",
+            "(defmacro bad (x x) x)",
+            "(defmacro bad (&rest) 1)",
+            "(defmacro bad (&rest x y) x)",
+            "(defmacro bad (x &rest x) x)",
+            "(defmacro one (x) x) (one missing extra)",
+            "(defmacro invalid () +) (invalid)",
+            "(apply bad '(2))",
+        ] {
+            assert!(runtime.execute(source).is_err(), "{source}");
+        }
+        let error = runtime
+            .execute("(defmacro forever () '(forever)) (forever)")
+            .err()
+            .unwrap();
+        assert!(error.message.starts_with("Evaluation limit"), "{error}");
+        assert_eq!(runtime.run("(+ 1 2)").unwrap(), "3");
+        let baseline = runtime.scopes.len();
+        for _ in 0..20 {
+            runtime
+                .execute("(let () (defmacro cyclic () cyclic) #t)")
+                .unwrap();
+            assert_eq!(
+                runtime.scopes.len(),
+                baseline,
+                "unreachable macro cycles must be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn gensym_identity_survives_quotation_eval_and_binding() {
+        assert_eq!(
+            run("
+            (define a (gensym))
+            (define b (gensym))
+            (list (symbol? a) (eq? a a) (eq? a b)
+                  (equal? a (string->symbol (symbol->string a))))
+            (eval `(define ,a 42))
+            (eval a)
+            (eval `(let ((,b 7)) (+ ,b ,a)))")
+            .lines()
+            .filter(|line| !line.starts_with("#:"))
+            .collect::<Vec<_>>(),
+            vec!["a", "b", "(#t #t #f #f)", "42", "49"]
+        );
+        assert_eq!(
+            run("(eval '(+ 1 2)) (apply eval (list '(+ 3 4)))
+            (define x 1) (let ((x 9)) (eval 'x))
+            (eval ''(a b)) (eval #f)"),
+            "3\n7\nx\n1\n(a b)\n#f"
+        );
+        let mut runtime = Interpreter::new();
+        for source in [
+            "(eval)",
+            "(eval 1 2)",
+            "(eval +)",
+            "(eval (list + 1 2))",
+            "(gensym 1)",
+        ] {
+            assert!(runtime.execute(source).is_err(), "{source}");
+        }
+        let error = runtime.execute("(eval '(/ 1 0))").err().unwrap();
+        assert!(error.to_string().contains("<eval>:1:1 in /"));
+        let error = runtime
+            .execute("(define (again) (eval '(again))) (again)")
+            .err()
+            .unwrap();
+        assert!(error.message.starts_with("Evaluation limit"), "{error}");
+        let error = runtime
+            .execute(
+                "(eval (let loop ((n 200) (data 1)) (if (= n 0) data (loop (- n 1) (list data)))))",
+            )
+            .err()
+            .unwrap();
+        assert!(error.message.starts_with("Call depth limit"), "{error}");
+    }
+
+    #[test]
+    fn random_library_is_reproducible_bounded_and_validated() {
+        assert_eq!(
+            run("(random-seed! 1)
+            (list (random-integer 10) (random-integer 10) (random-integer 10))
+            (random-seed! 1)
+            (= (random) (/ 48270 2147483646))
+            (random-integer 1)"),
+            "()\n(0 3 5)\n()\n#t\n0"
+        );
+        let mut runtime = Interpreter::new();
+        for _ in 0..100 {
+            let value = runtime.execute("(random)").unwrap().pop().unwrap().value;
+            assert!(matches!(value, Value::Number(number) if (0.0..1.0).contains(&number)));
+        }
+        for source in [
+            "(random-seed! 0)",
+            "(random-seed! 1.5)",
+            "(random-seed! #t)",
+            "(random-integer 0)",
+            "(random-integer -1)",
+            "(random-integer 2147483647)",
+        ] {
+            assert!(runtime.execute(source).is_err(), "{source}");
+        }
+        assert_eq!(
+            run("(random-seed! 9123) (random) (random-integer 97)"),
+            run("(random-seed! 9123) (random) (random-integer 97)"),
+            "explicit seeds reproduce a sequence"
+        );
+    }
+
+    #[test]
+    fn tagged_json_and_markup_can_be_parsed_edited_and_written() {
+        assert_eq!(run(r#"
+            (define data (json-parse "{\"a\":[null,true,3],\"empty\":{}}"))
+            (json-get (json-get data "a") 1)
+            (json-stringify (json-set data "a" '(array "λ" #f)))
+            (json-stringify (json-remove data "a"))
+            (json-stringify (json-parse "[]"))
+            (json-stringify (json-parse "{}"))
+            (json-stringify (json-parse "null"))
+        "#), "data\n#t\n\"{\\\"a\\\":[\\\"λ\\\",false],\\\"empty\\\":{}}\"\n\"{\\\"empty\\\":{}}\"\n\"[]\"\n\"{}\"\n\"null\"");
+        assert_eq!(run(r#"
+            (define doc (xml-parse "<root id=\"a\">Hi &amp; <![CDATA[bye]]><!--ok--></root>"))
+            (define root (car (node-find doc "root")))
+            (node-text root)
+            (node-attribute root "id")
+            (xml-stringify (node-with-attribute root "id" "b&c"))
+            (xml-stringify (node-with-children root (list "New <text>")))
+            (node-text (html-parse "<p>One<p>Two &amp; three"))
+            (html-stringify '(element "br" ()))
+            (html-stringify '(element "script" () "if (a < b) {}"))
+        "#), "doc\nroot\n\"Hi & bye\"\n\"a\"\n\"<root id=\\\"b&amp;c\\\">Hi &amp; bye<!--ok--></root>\"\n\"<root id=\\\"a\\\">New &lt;text&gt;</root>\"\n\"OneTwo & three\"\n\"<br>\"\n\"<script>if (a < b) {}</script>\"");
+        let mut runtime = Interpreter::new();
+        let output = runtime.run(r#"(xml-stringify (xml-parse "<r xmlns='u' xmlns:p='u' p:a='v' xml:lang='en'><child xmlns=''/></r>"))"#).unwrap();
+        assert!(
+            output.contains("p:a=\\\"v\\\"") && output.contains("xml:lang=\\\"en\\\""),
+            "{output}"
+        );
+        assert_eq!(
+            runtime
+                .run(r#"(xml-stringify (xml-parse "<r><!--a & b--></r>"))"#)
+                .unwrap(),
+            "\"<r><!--a & b--></r>\""
+        );
+        assert_eq!(runtime.run(r#"(node-text (xml-parse (xml-stringify (xml-parse "<x:r xmlns:x='urn:x'><x:c x:a='v'/></x:r>"))))"#).unwrap(), "\"\"");
+        for source in [
+            r#"(json-parse "{")"#,
+            "(json-stringify '(object (\"a\" 1) (\"a\" 2)))",
+            "(json-get '(array 1) 3)",
+            "(json-get '(object) \"missing\")",
+            "(json-set '(array 1) -1 2)",
+            "(json-stringify +)",
+            r#"(xml-parse "<r>")"#,
+            r#"(xml-parse "<!DOCTYPE r [<!ENTITY x 'boom'>]><r>&x;</r>")"#,
+            "(xml-stringify '(element \"bad name\" ()))",
+            "(html-stringify '(element \"br\" () \"child\"))",
+            "(xml-stringify '(comment \"bad--comment\"))",
+        ] {
+            assert!(runtime.execute(source).is_err(), "{source}");
+        }
+        let deep_xml = format!("{}{}", "<r>".repeat(150), "</r>".repeat(150));
+        let error = runtime
+            .call(Value::Builtin(XmlParse), vec![Value::Text(deep_xml)], 0)
+            .err()
+            .unwrap();
+        assert!(error.message.starts_with("Call depth limit"), "{error}");
+    }
+
+    #[test]
+    fn host_operations_are_explicit_and_return_structured_text_responses() {
+        let mut runtime = Interpreter::new();
+        assert!(runtime
+            .execute("(read-file \"data.json\")")
+            .err()
+            .unwrap()
+            .message
+            .contains("not configured"));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let captured = calls.clone();
+        runtime.set_host_handler(move |request| {
+            captured.borrow_mut().push(request);
+            Ok(HostResponse {
+                status: Some(404),
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: "hello".into(),
+            })
+        });
+        assert_eq!(runtime.run("(read-file \"file.txt\") (write-file \"out.txt\" \"new\") (define response (http-get \"https://example.test/\")) (list (http-status response) (http-body response))").unwrap(),
+            "\"hello\"\n()\nresponse\n(404 \"hello\")");
+        assert_eq!(calls.borrow().len(), 3);
+        for source in [
+            "(read-file 1)",
+            "(write-file \"x\" #t)",
+            "(http-get \"file:///x\")",
+            "(http-request \"get\" \"https://example.test\" '() \"\")",
+            "(http-request \"GET\" \"https://example.test\" '((\"bad\\nname\" \"x\")) \"\")",
+            "(http-request \"HEAD\" \"https://example.test\" '() \"body\")",
+        ] {
+            assert!(runtime.execute(source).is_err(), "{source}");
+        }
+        assert_eq!(
+            calls.borrow().len(),
+            3,
+            "invalid requests must not reach the host"
+        );
     }
 
     #[test]
@@ -2345,7 +3133,8 @@ mod tests {
         let error = runtime
             .execute_named("\n(+ 1 (fail 4))", "main.loop")
             .err()
-            .unwrap();
+            .unwrap()
+            .to_string();
         assert!(error.starts_with("Division by zero"), "{error}");
         assert!(error.contains("library.loop:2:3 in /"), "{error}");
         assert!(error.contains("main.loop:2:6 in fail"), "{error}");
@@ -2353,9 +3142,14 @@ mod tests {
         let error = runtime
             .execute_named("(list 'λ missing)", "unicode.loop")
             .err()
-            .unwrap();
+            .unwrap()
+            .to_string();
         assert!(error.contains("unicode.loop:1:10"), "{error}");
-        let error = runtime.execute_named("\n (", "broken.loop").err().unwrap();
+        let error = runtime
+            .execute_named("\n (", "broken.loop")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("broken.loop:2:2"), "{error}");
         assert!(Interpreter::is_incomplete("(list\n"));
         assert!(Interpreter::is_incomplete("'"));
@@ -2430,10 +3224,15 @@ mod tests {
             .execute("(load \"cycle.loop\")")
             .err()
             .unwrap()
+            .to_string()
             .contains("Cyclic"));
         assert!(runtime.loading.is_empty());
         runtime.register_source("broken.loop", "\n(/ 1 0)").unwrap();
-        let error = runtime.execute("(load \"broken.loop\")").err().unwrap();
+        let error = runtime
+            .execute("(load \"broken.loop\")")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("broken.loop:2:1 in /"), "{error}");
         assert!(runtime.register_source("bad\nname", "1").is_err());
         assert!(runtime
@@ -2447,6 +3246,7 @@ mod tests {
             .execute("(load \"forever\")")
             .err()
             .unwrap()
+            .to_string()
             .starts_with("Evaluation limit"));
         assert_eq!(runtime.run("(double 2)").unwrap(), "4");
     }
@@ -2489,7 +3289,11 @@ mod tests {
             assert!(Interpreter::new().execute(source).is_err(), "{source}");
         }
         let mut runtime = Interpreter::new();
-        let error = runtime.execute("(error \"bad value\" 3 'x)").err().unwrap();
+        let error = runtime
+            .execute("(error \"bad value\" 3 'x)")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.starts_with("bad value: 3 x"), "{error}");
         assert!(error.contains("in error"), "{error}");
         assert_eq!(runtime.run("(+ 1 2)").unwrap(), "3");

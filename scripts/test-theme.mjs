@@ -12,6 +12,8 @@ function setup(saved = null, readError, writeError) {
     addEventListener(type, listener) { listeners[type] = listener; },
   };
   const root = { dataset: {} };
+  let onSystemChange;
+  const system = { matches: false, addEventListener(type, listener) { assert.equal(type, "change"); onSystemChange = listener; } };
   let loaded;
   runInNewContext(source, {
     document: {
@@ -34,23 +36,33 @@ function setup(saved = null, readError, writeError) {
       },
     },
     console: { warn: (...args) => warnings.push(args) },
+    matchMedia: () => system,
   });
   return {
     root, select, warnings, writes, loaded,
     change(value) { select.value = value; listeners.change(); },
+    systemChange(dark) { system.matches = dark; onSystemChange(); },
   };
 }
 for (const saved of [null, "system", "light", "dark", "invalid"]) {
   const theme = setup(saved);
   const expected = ["light", "dark"].includes(saved) ? saved : "system";
   assert.equal(theme.root.dataset.theme, expected, "Theme must apply before DOMContentLoaded");
+  assert.equal(theme.root.dataset.bsTheme, expected === "dark" ? "dark" : "light");
   theme.loaded();
   assert.equal(theme.select.value, expected);
   for (const value of ["dark", "light", "system"]) {
     theme.change(value);
     assert.equal(theme.root.dataset.theme, value);
+    assert.equal(theme.root.dataset.bsTheme, value === "dark" ? "dark" : "light");
     assert.deepEqual(theme.writes.at(-1), ["loop-theme", value]);
   }
+  theme.systemChange(true);
+  assert.equal(theme.root.dataset.bsTheme, "dark");
+  theme.change("light");
+  theme.systemChange(false);
+  theme.systemChange(true);
+  assert.equal(theme.root.dataset.bsTheme, "light", "System changes must not override explicit themes");
 }
 const denied = setup(null, new DOMException("Blocked", "SecurityError"));
 assert.equal(denied.root.dataset.theme, "system");

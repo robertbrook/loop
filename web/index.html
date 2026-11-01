@@ -1,6 +1,4 @@
 <!doctype html>
-<!-- Loop workbench: program and results, with examples available in a select.
-Keep the cool-blue palette in both themes; omit promotional and tutorial copy. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -11,37 +9,56 @@ Keep the cool-blue palette in both themes; omit promotional and tutorial copy. -
   <title>Loop</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232449ba'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-size='42' fill='white' font-family='monospace'%3E()%3C/text%3E%3C/svg%3E">
   <script src="./theme.js"></script>
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./bootstrap.min.css">
   <script type="module" src="./app.js"></script>
 </head>
-<body>
-  <header class="masthead">
-    <h1>Loop</h1>
-    <div class="runtime"><span id="status-dot" class="status-dot" aria-hidden="true"></span><span id="runtime-status" role="status">Loading…</span></div>
-    <select id="theme" aria-label="Color theme">
+<body class="bg-1">
+  <header class="container py-4 d-flex align-items-center gap-3 flex-wrap">
+    <h1 class="fs-xl m-0">Loop</h1>
+    <div class="d-flex align-items-center gap-2 me-auto small fg-2"><span id="status-dot" class="fg-warning" aria-hidden="true">●</span><span id="runtime-status" role="status">Loading…</span></div>
+    <select id="theme" class="form-control form-control-sm w-auto" aria-label="Color theme">
       <option value="system">System</option>
       <option value="light">Light</option>
       <option value="dark">Dark</option>
     </select>
-    <a href="https://github.com/robertbrook/loop#language" target="_blank" rel="noreferrer">Reference</a>
-    <a href="https://github.com/robertbrook/loop" target="_blank" rel="noreferrer">Source</a>
+    <a class="small" href="https://github.com/robertbrook/loop#language" target="_blank" rel="noreferrer">Reference</a>
+    <a class="small" href="https://github.com/robertbrook/loop" target="_blank" rel="noreferrer">Source</a>
   </header>
-  <main>
-    <div class="workbench">
-      <section class="editor-panel" aria-labelledby="program-title">
-        <div class="panel-toolbar">
-          <h2 id="program-title">Program</h2>
-          <button id="open-files" class="quiet" disabled>Open files</button>
-          <input id="source-files" type="file" accept=".loop,.lisp,.scm,text/plain" multiple hidden>
-          <select id="example-list" aria-label="Load example or source file"></select>
-          <button id="run" class="primary" title="Run program (Ctrl/Cmd+Enter)" disabled>Run</button>
+  <main class="container pb-4">
+    <form id="repl-form" class="bg-body border rounded-3 p-3 mb-3">
+      <label class="form-label small" for="repl">REPL</label>
+      <div class="d-flex align-items-center gap-2">
+        <span class="font-monospace fg-primary" aria-hidden="true">λ</span>
+        <div class="position-relative flex-grow-1 min-w-0">
+          <input id="repl" class="form-control font-monospace" placeholder="(+ 1 2)" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-label="REPL expression" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="repl-suggestions" aria-describedby="repl-help">
+          <ul id="repl-suggestions" class="list-group position-absolute top-100 start-0 w-100 z-menu mt-1 shadow overflow-auto" role="listbox" aria-label="Symbol suggestions" hidden></ul>
         </div>
-        <div class="editor-wrap"><div id="line-numbers" aria-hidden="true">1</div><textarea id="editor" aria-label="Lisp program" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea></div>
+        <button id="repl-run" class="btn-solid theme-primary" type="submit" disabled aria-label="Evaluate expression">↵</button>
+      </div>
+      <div id="repl-help" class="form-text">Tab to complete · ↑↓ to choose · Esc to dismiss</div>
+    </form>
+    <div class="row g-3">
+      <section class="col-12 md:col-7" aria-labelledby="program-title">
+        <div class="bg-body border rounded-3 overflow-hidden">
+        <div class="p-3 border-bottom d-flex align-items-center gap-2 flex-wrap">
+          <h2 id="program-title" class="fs-sm m-0 me-auto">Program</h2>
+          <button id="open-files" class="btn-text btn-sm" disabled>Open files</button>
+          <button id="save-file" class="btn-text btn-sm">Save file</button>
+          <input id="source-files" type="file" accept=".loop,.lisp,.scm,.json,.xml,.html,text/*,application/json,application/xml" multiple hidden>
+          <select id="example-list" class="form-control form-control-sm w-auto max-w-100" aria-label="Load example or source file"></select>
+          <button id="run" class="btn-solid btn-sm theme-primary" title="Run program (Ctrl/Cmd+Enter)" disabled>Run</button>
+        </div>
+        <div class="position-relative">
+          <pre id="line-numbers" class="position-absolute top-0 bottom-0 start-0 overflow-hidden user-select-none text-end font-monospace fs-md lh-lg px-2 py-3 m-0 fg-3" aria-hidden="true">1</pre>
+          <textarea id="editor" rows="20" wrap="off" class="form-control font-monospace fs-md lh-lg rounded-0 border-0 ps-10 pe-3 py-3" aria-label="Lisp program" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea>
+        </div>
+        </div>
       </section>
-      <section class="results-panel" aria-labelledby="results-title">
-        <div class="panel-toolbar"><h2 id="results-title">Result</h2><button id="reset" class="quiet" title="Clear results and definitions">Reset session</button></div>
-        <div id="results" role="log" aria-label="Evaluation results" aria-live="polite" aria-relevant="additions"></div>
-        <form id="repl-form"><label for="repl">REPL</label><div class="repl-input"><span aria-hidden="true">λ</span><input id="repl" placeholder="(+ 1 2)" spellcheck="false" autocomplete="off" aria-label="REPL expression"><button id="repl-run" type="submit" disabled aria-label="Evaluate expression">↵</button></div></form>
+      <section class="col-12 md:col-5" aria-labelledby="results-title">
+        <div class="bg-body border rounded-3 overflow-hidden">
+          <div class="p-3 border-bottom d-flex align-items-center gap-2 flex-wrap"><h2 id="results-title" class="fs-sm m-0 me-auto">Result</h2><button id="reset" class="btn-text btn-sm" title="Clear results and definitions">Reset session</button></div>
+          <div class="ratio ratio-1x1 position-relative"><div id="results" class="position-absolute top-0 start-0 w-100 h-100 p-3 overflow-auto" role="log" aria-label="Evaluation results" aria-live="polite" aria-relevant="additions" tabindex="0"></div></div>
+        </div>
       </section>
     </div>
   </main>

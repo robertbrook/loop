@@ -1,4 +1,5 @@
 use loop_lisp::{Evaluation, Interpreter, INPUT_LIMIT};
+mod native_host;
 use std::{
     env, fs,
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -57,7 +58,11 @@ fn repl(runtime: &mut Interpreter) -> Result<(), String> {
             == 0
         {
             if !source.trim().is_empty() {
-                print_results(runtime.execute_named(&source, "<repl>")?)?;
+                print_results(
+                    runtime
+                        .execute_named(&source, "<repl>")
+                        .map_err(|error| error.to_string())?,
+                )?;
             }
             return Ok(());
         }
@@ -87,6 +92,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let mut runtime = Interpreter::new();
+    runtime.set_host_handler(native_host::handle);
     runtime.set_source_loader(|requested, caller| {
         let base = if caller.starts_with('<') {
             PathBuf::from(".")
@@ -103,13 +109,21 @@ fn run() -> Result<(), String> {
             return repl(&mut runtime);
         }
         let source = read_source(io::stdin().lock())?;
-        return print_results(runtime.execute_named(&source, "<stdin>")?);
+        return print_results(
+            runtime
+                .execute_named(&source, "<stdin>")
+                .map_err(|error| error.to_string())?,
+        );
     }
     if args[0] == "-e" {
         if args.len() != 2 {
             return Err("-e expects exactly one program argument".into());
         }
-        return print_results(runtime.execute_named(&args[1], "<command>")?);
+        return print_results(
+            runtime
+                .execute_named(&args[1], "<command>")
+                .map_err(|error| error.to_string())?,
+        );
     }
     for arg in args {
         let (name, source) = if arg == "-" {
@@ -119,7 +133,11 @@ fn run() -> Result<(), String> {
         } else {
             read_file(Path::new(&arg))?
         };
-        print_results(runtime.execute_named(&source, &name)?)?;
+        print_results(
+            runtime
+                .execute_named(&source, &name)
+                .map_err(|error| error.to_string())?,
+        )?;
     }
     Ok(())
 }

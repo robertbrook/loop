@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { builtAsset } from "./built-assets.mjs";
 import { formatEvaluations } from "../web/results.js";
+import { hostImports, browserHost } from "../web/host.js";
 
-const { instance } = await WebAssembly.instantiate(await readFile(builtAsset("loop.wasm")));
-const runtime = instance.exports;
+let runtime;
+const hostFiles = new Map();
+const { instance } = await WebAssembly.instantiate(await readFile(builtAsset("loop.wasm")), hostImports(
+  () => runtime.memory, browserHost(hostFiles, () => {}),
+));
+runtime = instance.exports;
 function execute(source) {
   const bytes = new TextEncoder().encode(source);
   const pointer = runtime.input_buffer(bytes.length);
@@ -113,6 +118,45 @@ assert.deepEqual(namedRequest("main.loop", '(load "math.loop") (import math squa
 assert.match(namedRequest("bad.loop", "\n(/ 1 0)").error, /bad.loop:2:1 in \//);
 assert.match(namedRequest("main.loop", '(load "not-opened.loop")').error, /Source not registered/);
 assert.match(namedRequest("bad\nname", "1", true).error, /control characters/);
+function rawRequest(operation, name, input) {
+  const filename = typeof name === "string" ? new TextEncoder().encode(name) : name;
+  const namePointer = runtime.source_name_buffer(filename.length);
+  new Uint8Array(runtime.memory.buffer, namePointer, filename.length).set(filename);
+  const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
+  const pointer = runtime.input_buffer(bytes.length);
+  new Uint8Array(runtime.memory.buffer, pointer, bytes.length).set(bytes);
+  const failed = runtime[operation]();
+  const result = JSON.parse(new TextDecoder().decode(new Uint8Array(
+    runtime.memory.buffer, runtime.output_pointer(), runtime.output_length())));
+  assert.equal(failed !== 0, result.error !== null);
+  return result;
+}
+for (const operation of ["evaluate", "evaluate_named", "register_source"]) {
+  assert.deepEqual(rawRequest(operation, "valid.loop", Uint8Array.of(255)), {
+    evaluations: [], error: "Input must be UTF-8",
+  }, operation);
+}
+for (const operation of ["evaluate_named", "register_source"]) {
+  assert.deepEqual(rawRequest(operation, Uint8Array.of(255), "1"), {
+    evaluations: [], error: "Source filename must be UTF-8",
+  }, operation);
+  assert.match(rawRequest(operation, "", "1").error, /must not be empty/);
+  assert.match(rawRequest(operation, "bad\nname", "1").error, /control characters/);
+}
+assert.deepEqual(rawRequest("evaluate", Uint8Array.of(255), "(+ 1 2)"), {
+  evaluations: [{ value: "3", output: "" }], error: null,
+}, "legacy evaluation ignores the named-request buffer");
+assert.deepEqual(rawRequest("register_source", "raw.loop", "(define raw-value 6)"), {
+  evaluations: [], error: null,
+});
+assert.match(evaluate("raw-value").text, /Unknown symbol/, "registration must not evaluate the source");
+assert.deepEqual(rawRequest("evaluate_named", "caller.loop", '(load "raw.loop") raw-value'), {
+  evaluations: [{ value: "raw-value", output: "" }, { value: "6", output: "" }], error: null,
+});
+assert.match(rawRequest("evaluate_named", "caller.loop", '(/ 1 0)').error, /caller.loop:1:1 in \//);
+assert.deepEqual(rawRequest("evaluate", "", "(+ 1 2)"), {
+  evaluations: [{ value: "3", output: "" }], error: null,
+}, "every operation must replace the previous error response");
 for (let i = 0; i < 50; i++) evaluate("(letrec ((f (lambda () f))) 'done)");
 const warmedMemory = runtime.memory.buffer.byteLength;
 for (let i = 0; i < 500; i++) {

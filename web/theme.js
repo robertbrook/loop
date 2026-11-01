@@ -9,14 +9,20 @@
     if (error.name !== "SecurityError") throw error;
     console.warn("Loop cannot read your saved theme; using the system theme.", error);
   }
-  document.documentElement.dataset.theme = preference;
+  const system = matchMedia("(prefers-color-scheme: dark)");
+  const apply = () => {
+    document.documentElement.dataset.theme = preference;
+    document.documentElement.dataset.bsTheme = preference === "system" ? (system.matches ? "dark" : "light") : preference;
+  };
+  apply();
+  system.addEventListener("change", () => { if (preference === "system") apply(); });
 
   document.addEventListener("DOMContentLoaded", () => {
     const select = document.getElementById("theme");
     select.value = preference;
     select.addEventListener("change", () => {
       preference = select.value;
-      document.documentElement.dataset.theme = preference;
+      apply();
       try {
         localStorage.setItem(key, preference);
       } catch (error) {
