@@ -27,7 +27,13 @@ for (const entrypoint of entrypoints) {
   assert.equal(new URL("./", resolved).href, assetDirectory.href, "All entrypoints must use one build");
   await readFile(resolved);
 }
-assert.ok(html.indexOf("/theme.js") < html.indexOf("/style.css"), "Saved theme must apply before styles");
+assert.ok(html.indexOf("/theme.js") < html.indexOf("/bootstrap.min.css"), "Saved theme must apply before styles");
+assert.ok(!html.includes("<style") && !html.includes('style="'), "Use Bootstrap classes, not custom styles");
+assert.ok(!files.includes("style.css"), "Bootstrap must be the only stylesheet");
+assert.deepEqual(files.filter(name => name.endsWith(".css")), ["bootstrap.min.css"]);
+assert.equal(hash(await readFile(builtAsset("bootstrap.min.css"))),
+  "678508b198d9b1b8877e338f419fdada00024be2bcc638a539dd724856095112",
+  "Use the unmodified Bootstrap 6 alpha snapshot pinned in README");
 for (const name of files.filter((name) => name.endsWith(".js"))) {
   const script = await readFile(builtAsset(name), "utf8");
   for (const match of script.matchAll(/(?:from\s+|new URL\()["'](\.\/[^"']+)["']/g)) {
